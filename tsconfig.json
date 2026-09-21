@@ -1,0 +1,27 @@
+{
+  // Development and typechecking, covering the tests too. The shipped build
+  // is tsconfig.build.json, which narrows this to src/.
+  "compilerOptions": {
+    // Matches all three consumers (fleet-service, automation-service,
+    // st-gateway): ES2022, CommonJS, node resolution, strict. The emitted
+    // .d.ts must resolve for them under `moduleResolution: node`, which is why
+    // nothing here uses an ESM-only construct or an "exports" map.
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "declaration": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "outDir": "./dist",
+    "types": ["node", "jest"]
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts"]
+}

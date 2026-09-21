@@ -1,0 +1,111 @@
+name: ci
+
+on:
+  # No branch filter: a pull request stacked on another branch needs the same
+  # checks as one targeting main. Filtering to main means a stacked PR runs
+  # nothing at all and looks green by default.
+  pull_request:
+  push:
+    branches: [main]
+
+# Read-only for the whole workflow. Nothing here publishes anything; the
+# release workflow is the only place `contents: write` appears, and it is
+# scoped to one job there.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # ts-jest only typechecks what a test imports, so without this a type
+      # error in an unreferenced file reaches main.
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - run: npm test
+
+      # The tarball a consumer installs is built here too, so a `files` list
+      # that forgot dist/ fails before a tag is ever pushed.
+      - name: Pack and check the tarball's contents
+        run: |
+          npm pack --silent > /dev/null
+          tarball=$(ls ./*.tgz)
+          tar -tzf "$tarball" | sort > packed.txt
+          cat packed.txt
+          for required in package/package.json package/README.md package/LICENSE \
+                          package/dist/index.js package/dist/index.d.ts; do
+            grep -qx "$required" packed.txt || {
+              echo "::error::$required is missing from the tarball"; exit 1; }
+          done
+          # Nothing outside dist/ and the three metadata files ships.
+          if grep -vqE '^package/(package\.json|README\.md|LICENSE|dist/)' packed.txt; then
+            echo "::error::the tarball carries files outside dist/"
+            grep -vE '^package/(package\.json|README\.md|LICENSE|dist/)' packed.txt
+            exit 1
+          fi
+
+      - name: Install the tarball into a scratch CommonJS project
+        run: |
+          tarball=$(readlink -f ./*.tgz)
+          mkdir -p /tmp/consumer && cd /tmp/consumer
+          npm init -y > /dev/null
+          npm install "$tarball" > /dev/null
+          # require() works, and the types resolve under moduleResolution: node.
+          node -e "
+            const c = require('@v-m-pioneer-trading/introspection-client');
+            for (const name of ['createAuthorizer','createExpressAuth','createLaneDeriver','loadIntrospectionConfig','MESSAGES']) {
+              if (typeof c[name] === 'undefined') throw new Error('missing export ' + name);
+            }
+            console.log('require() ok');
+          "
+          npm install --no-save typescript@5 @types/node@22 > /dev/null
+          cat > tsconfig.json <<'JSON'
+          {
+            "compilerOptions": {
+              "target": "ES2022",
+              "module": "commonjs",
+              "moduleResolution": "node",
+              "strict": true,
+              "skipLibCheck": true,
+              "noEmit": true,
+              "types": ["node"]
+            },
+            "include": ["probe.ts"]
+          }
+          JSON
+          cat > probe.ts <<'TS'
+          import {
+            createAuthorizer,
+            createLaneDeriver,
+            type Decision,
+            type Identity,
+            type Lane,
+          } from "@v-m-pioneer-trading/introspection-client";
+
+          const config = { url: "http://localhost:3005/auth/v1/introspect", secret: "x" };
+          const authorizer = createAuthorizer(config);
+          const deriver = createLaneDeriver(config);
+
+          export async function probe(): Promise<[Decision, Lane, Identity | null]> {
+            const decision = await authorizer.authorize({
+              method: "POST",
+              requires: "fleet:control",
+              authorization: "Bearer opaque",
+            });
+            const lane = await deriver.derive("Bearer opaque");
+            return [decision, lane, decision.outcome === "proceed" ? decision.identity : null];
+          }
+          TS
+          npx tsc -p tsconfig.json
+          echo "types resolve under moduleResolution: node"

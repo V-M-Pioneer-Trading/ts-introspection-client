@@ -1,0 +1,10 @@
+{
+  // What ships. `dist/` is never committed: it is built by `prepack` and by
+  // the release workflow, so a tarball can never disagree with its source.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "types": ["node"]
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,53 @@
+/**
+ * @file Public surface.
+ *
+ * Three entry points, deliberately separate:
+ *
+ * - {@link createAuthorizer} — the framework-agnostic policy, the twenty-four
+ *   calling-service cases of `meta/fixtures/introspection.json`.
+ * - {@link createExpressAuth} — the Express 4 adapter over it.
+ * - {@link createLaneDeriver} — st-gateway's lane policy, which never rejects
+ *   and is kept apart so nothing adopts it by accident.
+ */
+
+export type {
+  Decision,
+  Identity,
+  IntrospectionConfig,
+  Kind,
+  Lane,
+  RouteRequirement,
+} from "./types";
+
+export type { CenterAnswer, Introspector } from "./center";
+export { createIntrospector, splitScopes } from "./center";
+
+export type { Authorizer, InboundRequest } from "./core";
+export { bearerFrom, createAuthorizer } from "./core";
+
+export type { LaneDeriver } from "./gateway";
+export { createLaneDeriver } from "./gateway";
+
+export { IntrospectionConfigError, loadIntrospectionConfig } from "./config";
+
+export {
+  DEFAULT_MAX_RESPONSE_BYTES,
+  DEFAULT_TIMEOUT_MS,
+  ENV_SECRET,
+  ENV_URL,
+  MESSAGES,
+  SECRET_HEADER,
+} from "./messages";
+
+export type { ExpressAuth, RequirementResolver } from "./express";
+export {
+  actorOf,
+  createExpressAuth,
+  hasScope,
+  identityOf,
+  kindOf,
+  LOCALS_ACTOR,
+  LOCALS_IDENTITY,
+  LOCALS_KIND,
+  LOCALS_REQUIRES,
+} from "./express";

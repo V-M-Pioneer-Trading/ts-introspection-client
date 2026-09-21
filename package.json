@@ -1,0 +1,47 @@
+{
+  "name": "@v-m-pioneer-trading/introspection-client",
+  "version": "1.0.0",
+  "description": "Shared TypeScript client for auth-service token introspection: default-deny route guards, an Express 4 adapter and st-gateway's lane policy.",
+  "license": "MIT",
+  "author": "Max Radomskyi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/V-M-Pioneer-Trading/ts-introspection-client.git"
+  },
+  "homepage": "https://github.com/V-M-Pioneer-Trading/ts-introspection-client#readme",
+  "bugs": {
+    "url": "https://github.com/V-M-Pioneer-Trading/meta/issues/80"
+  },
+  "keywords": ["authorization", "introspection", "rfc7662", "express"],
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist", "README.md", "LICENSE"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "jest",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "express": "^4.17.0"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^22.10.5",
+    "@types/supertest": "^6.0.2",
+    "express": "^4.21.2",
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.7.3"
+  }
+}

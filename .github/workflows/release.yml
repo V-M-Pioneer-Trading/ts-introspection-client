@@ -1,0 +1,64 @@
+name: release
+
+# A `v*` tag builds, tests, packs and attaches the tarball to a GitHub
+# Release. There is no registry: GitHub Packages demands a token even for
+# public packages, which breaks the Docker builds (auth-design.md decision 21).
+# Consumers install the release asset URL and their package-lock pins its
+# integrity hash, so no token and no git are needed inside node:22-alpine.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # The only place in this repository with write access, on the one job that
+    # needs it — never at workflow level, where npm install scripts and test
+    # code would inherit it.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Refuse a tag that disagrees with package.json
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          declared=$(node -p "require('./package.json').version")
+          if [ "$tagged" != "$declared" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $declared"
+            exit 1
+          fi
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      - run: npm run build
+
+      - run: npm test
+
+      - name: Pack
+        id: pack
+        run: |
+          # `prepack` builds again; that is cheap and means the tarball can
+          # never be stale relative to the source it was cut from.
+          file=$(npm pack --silent | tail -n 1)
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          tar -tzf "$file"
+
+      - name: Publish the release with the tarball attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.file }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
