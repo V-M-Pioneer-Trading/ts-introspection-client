@@ -397,11 +397,15 @@ describe("8. secured() refuses an undeclared handler at registration time", () =
     expect(() => api.get("/ships/:id", handler)).toThrow(/requireScope/);
   });
 
-  it("accepts a declaration anywhere in the handler list, including nested", () => {
+  it("accepts a declaration in first position, and refuses one after a handler", () => {
+    // Position is the rule, not presence — see registration.test.ts for every
+    // ordering, for `route()` chains and for `use()`.
     const api = secured(express.Router());
     const a = auth();
     expect(() => api.get("/a", a.requireSession(), handler)).not.toThrow();
-    expect(() => api.get("/b", handler as never, a.allowPublic())).not.toThrow();
+    expect(() => api.get("/b", handler as never, a.allowPublic())).toThrow(
+      /before its authorization declaration/
+    );
     expect(() => api.get("/c", [a.requireSession(), handler] as never)).not.toThrow();
   });
 
@@ -413,6 +417,23 @@ describe("8. secured() refuses an undeclared handler at registration time", () =
     expect(() =>
       api.route("/y").get(auth().requireSession(), handler)
     ).not.toThrow();
+  });
+
+  it("does not reach a Route taken off the prototype, and says so", () => {
+    // `secured()` replaces `route` as an OWN property of the router, so
+    // `Object.getPrototypeOf(router).route.call(router, "/a")` returns a raw
+    // Route this package never sees. There is no cheap way to guard a Route
+    // the patched `route()` never returned — an interposed prototype would be
+    // a global mutation of Express itself — so it is listed in the README
+    // under "What this package does not protect", beside `router.stack.push`,
+    // and pinned here so the gap is a known one rather than folklore.
+    const api = secured(express.Router());
+    const raw = (
+      Object.getPrototypeOf(api) as {
+        route(path: string): { get(h: unknown): unknown };
+      }
+    ).route.call(api, "/bypass");
+    expect(() => raw.get(handler)).not.toThrow();
   });
 
   it("throws for use() of a bare middleware, and names the escape hatch", () => {
@@ -479,25 +500,21 @@ describe("8. secured() refuses an undeclared handler at registration time", () =
 // What a resolver is handed
 // ---------------------------------------------------------------------------
 
-describe("what a use-mounted resolver can and cannot see", () => {
-  it("is handed baseUrl, originalUrl and path — and no matched route", async () => {
-    // Pinned so the trap is visible rather than folklore: inside a router
-    // mounted at /api, `req.path` is `/ships`. A table keyed
-    // "GET /api/ships" misses every time, and `req.route` is undefined
-    // because no route layer has matched yet — which is why a `use`-mounted
-    // resolver has no honest way to key on a path at all.
+describe("a resolver is handed the method and nothing else", () => {
+  it("sees exactly one property, whatever the request's path was", async () => {
+    // S4. The resolver used to be handed `path`, `baseUrl`, `originalUrl` and
+    // `route` — which is an invitation to write the table this whole design
+    // exists to delete. Inside a router mounted at /api, `req.path` is
+    // `/ships` and not `/api/ships`; it has not been through Express's
+    // matcher; a trailing slash, a case-variant and a `:parameter` all miss a
+    // literal key; and `req.route` is undefined in a `use` mount because no
+    // route layer has matched yet. None of it is reachable any more.
     const seen: Record<string, unknown>[] = [];
     const application = express();
     const api = express.Router();
     api.use(
-      auth().guard((req) => {
-        seen.push({
-          method: req.method,
-          path: req.path,
-          baseUrl: req.baseUrl,
-          originalUrl: req.originalUrl,
-          route: req.route,
-        });
+      auth().guard((context) => {
+        seen.push({ ...context, keys: Object.keys(context) });
         return "none";
       })
     );
@@ -509,33 +526,83 @@ describe("what a use-mounted resolver can and cannot see", () => {
     await request(application).get("/api/ships?fleet=1");
 
     expect(seen).toHaveLength(1);
-    expect(seen[0]?.path).toBe("/ships");
-    expect(seen[0]?.baseUrl).toBe("/api");
-    expect(seen[0]?.originalUrl).toBe("/api/ships?fleet=1");
-    expect(seen[0]?.route).toBeUndefined();
+    expect(seen[0]?.keys).toEqual(["method"]);
+    expect(seen[0]?.method).toBe("GET");
   });
 
-  it("gives a route-attached declaration the matched route pattern", async () => {
-    // For comparison: on a route, `req.route.path` is the PATTERN, not the
-    // request's path. It is handed over for diagnostics; the declaration does
-    // not need it, because the declaration is already on that route.
-    const seen: unknown[] = [];
+  it("reads HEAD as GET, because Express dispatches it to the GET handler", async () => {
+    const seen: string[] = [];
+    const application = express();
+    application.use(
+      auth().guard(({ method }) => {
+        seen.push(method);
+        return "none";
+      })
+    );
+    application.get("/ships", (_req, res) => {
+      res.json({ ok: true });
+    });
+
+    await request(application).head("/ships");
+    expect(seen).toEqual(["GET"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 9. Express answers OPTIONS itself, before any route layer runs
+// ---------------------------------------------------------------------------
+
+describe("9. Express's automatic OPTIONS never reaches the declaration", () => {
+  /**
+   * P3 used to read "a declared requirement is enforced identically for every
+   * method", which is false for the one method Express answers on its own
+   * behalf. When a request's path matches a route but its method does not,
+   * Express's router replies `200` with an `Allow:` header **before** any
+   * layer on that route runs — so a declaration attached to the route does
+   * not execute, no handler runs, and nothing is authorized away, but the
+   * route's existence and its method list are disclosed to an anonymous
+   * caller.
+   *
+   * P3 now says "every method Express dispatches to the route", and the
+   * disclosure is listed under "What this package does not protect". Pinned
+   * here so a future change to it is noticed rather than assumed.
+   */
+  it("answers OPTIONS with Allow, runs no handler and asks no center", async () => {
+    const calls: string[] = [];
+    const counting = createExpressAuth({
+      introspect: (token: string) => {
+        calls.push(token);
+        return Promise.resolve({ state: "inactive" as const });
+      },
+    });
+
     const application = express();
     const api = secured(express.Router());
-    api.get(
-      "/ships/:id",
-      auth().guard((req) => {
-        seen.push(req.route?.path);
-        return "none";
-      }),
-      (_req, res) => {
-        res.json({ ok: true });
-      }
-    );
+    api.get("/ships", counting.requireScope("fleet:control"), mutatingHandler("list"));
     application.use("/api", api);
 
-    const response = await request(application).get("/api/ships/abc");
+    const response = await request(application)
+      .options("/api/ships")
+      .set("Authorization", "Bearer operator.token");
+
     expect(response.status).toBe(200);
-    expect(seen).toEqual(["/ships/:id"]);
+    expect(response.headers["allow"]).toContain("GET");
+    expect(sideEffects).toEqual([]);
+    expect(calls).toEqual([]);
+  });
+
+  it("still enforces the declaration on a route that DOES answer OPTIONS", async () => {
+    // The distinction that makes the wording honest: `app.all` (and an
+    // explicit `.options`) registers a layer for OPTIONS, so Express
+    // dispatches to the route and the declaration runs. Section 1 above
+    // covers that case; this is the contrast.
+    const application = express();
+    const api = secured(express.Router());
+    api.all("/ships", auth().requireScope("fleet:control"), mutatingHandler("all"));
+    application.use("/api", api);
+
+    const response = await request(application).options("/api/ships");
+    expect(response.status).toBe(401);
+    expect(sideEffects).toEqual([]);
   });
 });

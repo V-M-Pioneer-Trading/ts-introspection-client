@@ -116,7 +116,7 @@ const fleetApp = (): Express => {
 
   const api = express.Router();
   api.use(
-    a.guard((req) => (req.method === "GET" ? "session" : "fleet:control"))
+    a.guard(({ method }) => (method === "GET" ? "session" : "fleet:control"))
   );
   api.get("/cooldown", (_req, res) => {
     res.json({ actor: actorOf(res), identity: identityOf(res) });
@@ -296,7 +296,7 @@ const fakeResponse = (): FakeResponse => {
 /** Runs one guard against a hand-made request, and waits for it to settle. */
 const runHandler = (
   handler: HandlerLike,
-  req: { method: string; path: string; authorization?: string },
+  req: { method: string; authorization?: string },
   res: FakeResponse
 ): Promise<{ nexted: boolean; error: unknown }> =>
   new Promise((resolve) => {
@@ -309,7 +309,6 @@ const runHandler = (
     handler(
       {
         method: req.method,
-        path: req.path,
         header: (name: string) =>
           name.toLowerCase() === "authorization" ? req.authorization : undefined,
       },
@@ -455,7 +454,7 @@ describe("safe methods (meta fixture v2)", () => {
       ["POST", 500],
     ] as const) {
       const res = fakeResponse();
-      await runHandler(handler, { method, path: "/x" }, res);
+      await runHandler(handler, { method }, res);
       expect(res.statusCode).toBe(expected);
     }
   });
@@ -464,7 +463,6 @@ describe("safe methods (meta fixture v2)", () => {
 describe("a guard that cannot do its job fails closed", () => {
   const guardedMutation = {
     method: "POST",
-    path: "/targets",
     authorization: "Bearer operator.token",
   };
 
@@ -552,7 +550,7 @@ describe("a guard that cannot do its job fails closed", () => {
 
     for (const method of ["GET", "HEAD", "OPTIONS", "POST", "DELETE"]) {
       const res = fakeResponse();
-      const { nexted } = await runHandler(handler, { method, path: "/x" }, res);
+      const { nexted } = await runHandler(handler, { method }, res);
       expect(nexted).toBe(false);
       expect(res.statusCode).toBe(500);
       expect(res.body).toEqual({ error: { message: MESSAGES.undeclaredRoute } });
@@ -566,7 +564,7 @@ describe("a guard that cannot do its job fails closed", () => {
     const res = fakeResponse();
     await runHandler(
       handler,
-      { method: "GET", path: "/x", authorization: "Bearer operator.token" },
+      { method: "GET", authorization: "Bearer operator.token" },
       res
     );
     expect(res.statusCode).toBe(500);
@@ -601,16 +599,20 @@ describe("the guard trusts req.method and nothing else", () => {
 });
 
 describe("there is one source of truth for the identity", () => {
-  it("publishes identity and actor, and no separate kind", async () => {
-    // S4. `res.locals.kind` existed and was removed: a second copy of the
-    // center's answer is a second thing to keep true, and the failure this
+  it("publishes nothing under a string key, and no separate kind", async () => {
+    // The identity lives under a module-private Symbol, so there is no
+    // `res.locals.identity` to read instead of `identityOf(res)` — and none of
+    // it appears in `Object.keys(res.locals)` or in a `JSON.stringify` of it.
+    //
+    // There is also deliberately no second copy of `kind`: a second copy of
+    // the center's answer is a second thing to keep true, and the failure this
     // package exists to prevent is a service deriving `kind` for itself.
-    // `kindOf(res)` reads `res.locals.identity`, and that is the whole story.
     const app = express();
     const api = secured(express.Router());
     api.get("/whoami", auth().requireSession(), (_req, res) => {
       res.json({
         locals: Object.keys(res.locals).sort(),
+        serialised: JSON.stringify(res.locals),
         kindOf: kindOf(res),
         actorOf: actorOf(res),
       });
@@ -621,7 +623,8 @@ describe("there is one source of truth for the identity", () => {
       .get("/whoami")
       .set("Authorization", "Bearer disagreeing.token");
     expect(response.status).toBe(200);
-    expect(response.body.locals).toEqual(["actor", "authRequires", "identity"]);
+    expect(response.body.locals).toEqual([]);
+    expect(response.body.serialised).toBe("{}");
     // The center said machine for a `user_` subject, and that is what is read.
     expect(response.body.kindOf).toBe("machine");
     expect(response.body.actorOf).toBe("user_operator");

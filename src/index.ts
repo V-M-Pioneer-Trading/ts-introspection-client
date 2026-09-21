@@ -3,7 +3,7 @@
  *
  * Three entry points, deliberately separate:
  *
- * - {@link createAuthorizer} — the framework-agnostic policy, the thirty-one
+ * - {@link createAuthorizer} — the framework-agnostic policy, the thirty-five
  *   calling-service cases of `meta/fixtures/introspection.json`.
  * - {@link createExpressAuth} — the Express 4 adapter over it, whose
  *   declarations live at route registration so Express's own matcher binds
@@ -44,6 +44,7 @@ export {
 
 export type {
   ExpressAuth,
+  GuardContext,
   HandlerLike,
   NextLike,
   RequestLike,
@@ -53,13 +54,11 @@ export type {
 export {
   actorOf,
   createExpressAuth,
-  declarationOf,
   hasScope,
   identityOf,
   kindOf,
-  LOCALS_ACTOR,
-  LOCALS_IDENTITY,
-  LOCALS_REQUIRES,
+  notFound,
   passthrough,
+  requirementOf,
   secured,
 } from "./express";

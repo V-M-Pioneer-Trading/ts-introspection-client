@@ -154,7 +154,11 @@ jobs:
               "moduleResolution": "node",
               "esModuleInterop": true,
               "strict": true,
-              "skipLibCheck": true,
+              // false, like the core probe: the adapter claims its .d.ts is
+              // clean against a real consumer's own settings, and
+              // skipLibCheck: true suppresses exactly the errors that would
+              // disprove it.
+              "skipLibCheck": false,
               "noEmit": true,
               "types": ["node"]
             },
@@ -169,6 +173,7 @@ jobs:
             hasScope,
             identityOf,
             kindOf,
+            notFound,
             passthrough,
             secured,
           } from "@v-m-pioneer-trading/introspection-client";
@@ -205,32 +210,75 @@ jobs:
           app.use("/api/automation/v1", api);
 
           // The generated-router shape: a resolver keyed on the METHOD, which
-          // is path-independent and therefore safe. `undefined` means
-          // undeclared, and there is deliberately no `?? "none"` to write.
+          // is all it is given. `undefined` means undeclared, and there is
+          // deliberately no `?? "none"` to write.
           const generated = express.Router();
           generated.use(
-            auth.guard((req) => (req.method === "GET" ? "session" : "fleet:control"))
+            auth.guard(({ method }) => (method === "GET" ? "session" : "fleet:control"))
           );
           app.use("/api/fleet/v1", generated);
+
+          // The declared-mount constructs the three consumers actually have:
+          // a third-party middleware list and a body parser behind one
+          // leading declaration, and a terminal JSON 404 of arity 2.
+          const secureApp = secured(express());
+          secureApp.use(
+            "/proxy",
+            auth.requireSession(),
+            express.raw({ type: "*/*", limit: "5mb" }),
+            (_req, res) => {
+              res.json({ proxied: true });
+            }
+          );
+          secureApp.use("/assets", auth.allowPublic(), express.static("public"));
+          secureApp.use(
+            notFound((_req, res) => {
+              res.status(404).json({ error: { message: "not found" } });
+            })
+          );
           TS
           npx tsc -p tsconfig.express.json
           echo "the adapter typechecks against a real Express app with no cast"
 
-      # The claim that matters most about `secured()` is a RUNTIME one, and a
-      # typecheck cannot see it: an undeclared route must throw at startup.
-      # Proven against the packed tarball rather than the source tree, because
-      # that is what a consumer installs.
-      - name: Prove the tarball refuses an undeclared route at startup
+      # The claims that matter most about `secured()` are RUNTIME ones, and a
+      # typecheck cannot see them. Proven against the packed tarball rather
+      # than the source tree, because that is what a consumer installs.
+      - name: Prove the tarball enforces the registration rules at startup
         run: |
           cd /tmp/consumer
           node -e "
             const express = require('express');
-            const { createExpressAuth, secured } = require('@v-m-pioneer-trading/introspection-client');
+            const { createExpressAuth, notFound, passthrough, secured } =
+              require('@v-m-pioneer-trading/introspection-client');
             const auth = createExpressAuth({ url: 'http://localhost:3005/auth/v1/introspect', secret: 'x' });
+            const handler = (_req, res) => res.json({});
+            const refuses = (what, fn) => {
+              let threw = false;
+              try { fn(); } catch { threw = true; }
+              if (!threw) throw new Error('accepted: ' + what);
+            };
+
+            refuses('an undeclared route', () => secured(express.Router()).get('/ships', handler));
+            refuses('a declaration after the handler', () =>
+              secured(express.Router()).get('/ships', handler, auth.requireScope('fleet:control')));
+            refuses('two declarations on one route', () =>
+              secured(express.Router()).get('/ships', auth.requireSession(), auth.allowPublic(), handler));
+            refuses('an undeclared route() chain', () =>
+              secured(express.Router()).route('/ships').get(handler));
+            refuses('a use() of a bare middleware', () => secured(express.Router()).use(handler));
+            refuses('requireScope(\"none\")', () => auth.requireScope('none'));
+            refuses('requireScope(\"session\")', () => auth.requireScope('session'));
+
+            // And the constructs the consumers actually have are accepted.
             const api = secured(express.Router());
-            let threw = false;
-            try { api.get('/ships', (_req, res) => res.json({})); } catch { threw = true; }
-            if (!threw) throw new Error('an undeclared route was accepted');
-            api.get('/ships', auth.requireSession(), (_req, res) => res.json({}));
-            console.log('secured() refuses an undeclared route and accepts a declared one');
+            api.get('/ships', auth.requireSession(), handler);
+            api.use(passthrough(express.json(), 'parses bodies; never answers'));
+            const app = secured(express());
+            app.use('/proxy', auth.requireSession(), express.raw({ type: '*/*' }), handler);
+            app.use('/swagger', auth.allowPublic(), [handler], handler);
+            app.use(notFound((_req, res) => res.status(404).json({ error: { message: 'not found' } })));
+            app.use((err, _req, res, _next) => res.status(500).json({ error: { message: String(err) } }));
+            refuses('a route after notFound()', () => app.get('/late', auth.allowPublic(), handler));
+
+            console.log('secured() enforces position, arity and the reserved words');
           "

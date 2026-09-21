@@ -1,215 +1,228 @@
 # @v-m-pioneer-trading/introspection-client
 
-The TypeScript half of "one verifier". Every service in this system used to
-verify Clerk tokens itself — six hand-ported copies across four languages,
-which drifted in error text, in whether an actor was recorded and in which
-routes had a guard at all, and which produced two real holes where a route
-simply had none. [auth-design decision 21][d21] reverses that: auth-service
-becomes the only component that verifies a token, and everyone else asks it
+The TypeScript half of "one verifier". [auth-design decision 21][d21] makes
+auth-service the only component that verifies a token; everyone else asks it
 what the token carries and compares the answer against what their own route
-declares. This package is that client for the three Node services
-(fleet-service, automation-service, st-gateway), and its behaviour is not
-described here but *fixed* by [`fixtures/introspection.json`][fixture] in the
-`meta` repository — thirty-five conditions for a calling service and ten more
-for st-gateway's queue lane, each with the center's response and the exact
-status, message, identity and call count expected. That file is vendored into
-`test/fixtures/` and the conformance suite drives all forty-five of its cases
-against a real local HTTP stub.
+declared. This package is that client for the three Node services
+(fleet-service, automation-service, st-gateway).
 
-Zero runtime dependencies, and **no peer dependencies at all** — not even
-Express. The adapter's types are declared locally (see
-[Method handling](#method-handling)), so a consumer that never touches Express
-typechecks this package with `skipLibCheck: false` and nothing installed.
-CommonJS plus `.d.ts`. Node >= 18, asserted at startup rather than hoped for:
-`loadIntrospectionConfig()` refuses to start if `globalThis.fetch` is missing,
-because the alternative is a `503` on every credentialed request that reads as
-an auth outage.
+Its behaviour is not described here but *fixed* by
+[`fixtures/introspection.json`][fixture] in `meta` — thirty-five conditions for
+a calling service and ten for st-gateway's queue lane, each with the center's
+response and the exact status, message, identity and call count expected. It is
+vendored into `test/fixtures/`, and the conformance suite drives all forty-five
+cases against a real local HTTP stub.
 
-## Install
-
-There is no registry. GitHub Packages demands a token even for public
-packages, which breaks a `npm ci` inside `node:22-alpine`, and a git
-dependency would need git in the image. Instead a `v*` tag builds, tests and
-packs the package and attaches the tarball to a GitHub Release, and consumers
-install that URL:
+Zero runtime dependencies and **no peer dependencies at all** — not even
+Express, whose types are declared locally, so a consumer with
+`skipLibCheck: false` and no `@types/express` typechecks this package with
+nothing installed. CommonJS plus `.d.ts`, Node >= 18. There is no registry: a
+`v*` tag attaches the tarball to a GitHub Release and consumers install that
+URL, which `package-lock.json` records with an integrity hash, so the Docker
+build needs no token and no git.
 
 ```sh
 npm install https://github.com/V-M-Pioneer-Trading/ts-introspection-client/releases/download/v1.0.0/v-m-pioneer-trading-introspection-client-1.0.0.tgz
 ```
 
-`package-lock.json` records the URL with an integrity hash, so the Docker build
-needs no token, no git and no network beyond the registry it already reaches.
-`dist/` is never committed; it is built by `prepack`, so a tarball cannot
-disagree with the source it was cut from.
-
-## Usage
-
-Configuration comes from two environment variables and is validated at
-startup, because a service that starts without them would answer `503` to every
-mutation and look like an auth outage instead of a misconfiguration:
+## Quick start
 
 ```ts
-import { loadIntrospectionConfig } from "@v-m-pioneer-trading/introspection-client";
-
-const config = loadIntrospectionConfig(); // throws, naming the missing variable
-```
-
-### Declare at the route, and let Express bind it
-
-A route says what it needs where it is registered. Express's own matcher then
-binds the declaration to exactly the route it binds the handler to — so a mount
-prefix, a trailing slash, a case-variant path, a `:parameter` and a `HEAD`
-arriving at its `GET` route all resolve the way the route does, because they
-*are* the route.
-
-`secured()` is the half that cannot be forgotten: it refuses, **at
-registration time**, to register a handler that carries no declaration. The
-process does not start. An undeclared route does not exist, rather than
-existing and being noticed the first time somebody asks for it.
-
-```ts
+import express from "express";
 import {
   actorOf,
   createExpressAuth,
-  passthrough,
+  loadIntrospectionConfig,
+  notFound,
   secured,
 } from "@v-m-pioneer-trading/introspection-client";
 
-const auth = createExpressAuth(config);
+const auth = createExpressAuth(loadIntrospectionConfig()); // throws, naming a missing env var
+const app = secured(express());
 const api = secured(express.Router());
 
-api.use(passthrough(express.json(), "parses bodies; never answers"));
-
-api.get("/health", auth.allowPublic(), health);
+api.get("/health", auth.allowPublic(), (_req, res) => res.json({ status: "ok" }));
 api.get("/targets", auth.requireSession(), listTargets);
-api.get("/targets/:id", auth.requireSession(), readTarget);
-api.post("/targets", auth.requireScope("fleet:control"), (_req, res) => {
-  res.json({ by: actorOf(res) });
-});
+api.post("/targets", auth.requireScope("fleet:control"), (req, res) =>
+  res.json({ by: actorOf(res) })
+);
 
 app.use("/api/automation/v1", api);
+app.use(notFound((_req, res) => res.status(404).json({ error: { message: "not found" } })));
 ```
 
-Leave a declaration off and the service refuses to boot:
+The declaration is the route's **first** handler. Leave it off, put it second,
+or write two, and the process does not start, with a message naming the route
+and listing the three spellings.
 
-```
-router.get(/ships/:id) was registered without an authorization declaration.
+## Security model
 
-Every route must say what it needs, at the point it is registered:
+**P1. A route with no declaration is never served — on any method, including
+`GET`, `HEAD` and `OPTIONS`.** "Public" is a thing a route says out loud with
+`allowPublic()`, never a thing that happens because a lookup missed. A
+`guard()` resolver returning `undefined` or throwing is *undeclared*, which is
+`500 this route declares no required scope`, decided before the `Authorization`
+header is read and without calling the center. There is no fallback to
+`"none"`.
 
-    auth.allowPublic()                 — anyone, including an anonymous visitor
-    auth.requireSession()              — any verified session
-    auth.requireScope("fleet:control") — a session carrying that scope
+> This is an **adapter** rule about a missing declaration, not the fixture's
+> `requires: "none"`, which is a route that *declared* no credential is needed.
+> "Undeclared" has no representation in the fixture at all.
 
-If this handler is middleware rather than a route — a body parser, CORS, a
-logger — wrap it: passthrough(handler, "why it never answers").
-```
+**P2. Route matching is Express's job.** Declarations live at registration, so
+Express's own matcher binds a requirement to the same route it binds the
+handler to: a prefix-mounted router, a trailing slash, a case-variant path and
+a `:parameter` never become a string this package looks up. A `guard()`
+resolver is handed `{ method }` and nothing else for the same reason — inside a
+`use` mount no route has matched yet, so any path it reconstructed would be a
+second, worse matcher.
 
-`secured()` patches the router in place and returns it, so it is still an
-`express.Router` in every other respect: mount it, nest it (nest `secured()`
-routers inside each other), chain `route()`. `use()` accepts a declaration, a
-`guard()`, another secured router, an error handler, or a `passthrough()` —
-and nothing else, because from the outside a middleware and a route are the
-same shape and only the author knows which one will answer.
+**P3. Position is part of the declaration, and there is exactly one.** Express
+runs a route's handlers in registration order, so a declaration behind a
+handler is a handler that already answered. Only a `passthrough()` may precede
+one. Two declarations are refused outright.
 
-**`allowPublic()` is how a route becomes public, and the only way.** A route
-nobody declared is not public; it is undeclared, and undeclared fails closed.
+**P4. A declared requirement is enforced for every method Express dispatches to
+the route.** `HEAD` reaches its `GET` route's declaration because Express
+dispatches it there, so a credential-free `HEAD` on a guarded route is the same
+`401` as a `GET`; an `app.all` route answers `OPTIONS` with the real handler,
+so its declaration governs that too. The safe methods are exempt from
+**default-deny** — a route that declared `"none"` serves them to a visitor —
+and from nothing else. An `OPTIONS` whose path matches but whose method does
+not is answered by Express itself, before any layer on the route runs; see the
+disclosure below.
 
-### Generated routers — fleet-service's shape
+**P5. CORS preflight works because `cors()` terminates it**, not because the
+guard waves it through, so **mount `cors()` first**. Mounted after, an Express
+router answers the preflight itself with a `200`, an `Allow` header and no
+`Access-Control-Allow-Origin`, and the browser fails it. A test pins both
+orders, so the remedy is known to be the mount order rather than an exemption
+for `OPTIONS`.
 
-fleet-service's routes come out of tsoa. There is no call site to put a
-declaration in, so it keeps a router-level guard:
+**P6. One inbound request asks the center at most once.** A router-level
+`guard()` and a route's own declaration both enforce — the stricter effectively
+wins, because each compares the same answer against its own requirement — but
+the answer is memoized for the life of the response, under a module-private
+Symbol on `res.locals`, keyed on the exact `Authorization` header value. It is
+never shared between requests: a process-wide cache would be a second
+verification path, would make revocation meaningless for its lifetime, and
+would hand one caller's identity to the next caller presenting the same header.
+
+### What this package does **not** protect
+
+A fence whose gaps are unknown is worse than no fence.
+
+- **Anything mounted before the guard or the secured router.** It answers
+  without ever reaching them. A body parser is fine there; a route is not.
+- **Handlers registered on an app or router that was never `secured()`.**
+  (A reference taken *before* `secured()` is fine: it patches in place, so
+  every alias goes through the patched methods.)
+- **A Route obtained around the patch** — `Object.getPrototypeOf(router).route
+  .call(router, "/x").get(handler)` — and a layer pushed straight onto
+  `router.stack`. Both reach Express's internals without passing through any
+  method this package replaced. Closing them would mean mutating Express's own
+  prototypes.
+- **The existence of a route, on an automatic `OPTIONS`.** Express replies
+  before any layer on the route runs, so no handler executes and nothing is
+  authorized away — but the path and its method list are disclosed to an
+  anonymous caller. A route registered with `app.all` or `.options` does not
+  have this property, because Express dispatches to it and the declaration
+  runs.
+- **What a `passthrough()` actually does.** It is the author's word that a
+  handler is middleware and will never answer. That is why it takes a reason.
+- **A second copy of this package in one process.** `secured()` would not
+  recognise the other copy's declarations — a refusal to start, not a hole.
+- **Anything after the guard runs.** A knob fence, a tenant check, an ownership
+  check are the handler's.
+- **The method, if something upstream rewrote it.** `X-HTTP-Method-Override` is
+  ignored here and always will be; mount any override middleware **before** the
+  guard, or the requirement is decided about one method and the route runs as
+  another.
+
+## Migrating an Express app
+
+Every construct the three services contain, in the spelling this package
+accepts.
 
 ```ts
+const app = secured(express());
+
+// 1. Health routes: public is declared out loud, and a bare `app.get` is not.
+app.get("/health", auth.allowPublic(), health);
+app.get("/api/fleet/health", auth.allowPublic(), health);
+
+// 2. A generated router (tsoa) has no call site for a declaration, so it gets
+//    a router-level guard. The resolver is a function of the METHOD alone.
 const api = express.Router();
-api.use(auth.guard((req) => (req.method === "GET" ? "session" : "fleet:control")));
+api.use(auth.guard(({ method }) => (method === "GET" ? "session" : "fleet:control")));
 RegisterRoutes(api);
 app.use("/api/fleet/v1", api);
+
+// 3. A DECLARED MOUNT: the leading declaration covers everything after it, so
+//    third-party middleware that cannot be branded needs no wrapper.
+app.use("/api/fleet/swagger", auth.allowPublic(), swaggerUi.serve, swaggerUi.setup(spec));
+app.use("/assets", auth.allowPublic(), express.static(assetDir));
+app.use("/proxy", auth.requireSession(), express.raw({ type: "*/*", limit: "5mb" }), proxy);
+
+// 4. Middleware that never answers says so, once, with a reason.
+app.use(passthrough(express.json(), "parses bodies; never answers"));
+app.use(passthrough(cors(corsOptions), "answers preflights; never serves a resource"));
+
+// 5. The terminal JSON 404. It serves no resource, so it needs no credential
+//    and never asks the center — and nothing but an error handler may follow it.
+app.use(notFound((_req, res) => res.status(404).json({ error: { message: "not found" } })));
+
+// 6. Error handlers (arity 4) are accepted as they are: Express invokes such a
+//    layer only with an error already in hand, so it can never serve a route.
+app.use((err, _req, res, _next) => res.status(500).json({ error: { message: "internal" } }));
 ```
 
-**That resolver is a function of the method and nothing else, and that is the
-point.** A `use`-mounted middleware runs *before* any route layer matches, so
-`req.route` is `undefined` there and no honest path key exists: `req.path` is
-the path after the mount prefix, it has not been through Express's matcher,
-and reconstructing what Express would have matched is the thing this package
-stopped trying to do. Key on the method, or declare at the route.
-
-A resolver that returns `undefined`, or throws, means **undeclared**: `500
-this route declares no required scope`, on every method including `GET`,
-before the `Authorization` header is read. There is no `?? "none"` to write,
-and there is deliberately no way to spell "I could not find this route, serve
-it anyway".
-
-The resolver is handed `method`, `path`, `baseUrl`, `originalUrl`, `header()`
-and — when a route has matched, which for a `use` mount it has not —
-`route.path`. `baseUrl` and `originalUrl` are there so a diagnostic can name
-the whole path; they are not a route key.
-
-On a `HEAD`, the resolver is called with `method` reading `"GET"`, because
-`HEAD /x` is the same route as `GET /x` and Express dispatches it there. The
-real `req.method` is never mutated.
+st-gateway is the one consumer that does **not** secure its app: `/proxy`
+forwards anonymous mutations by design (`POST /register` carries the caller's
+own account token, and auth-service polls `GET /` with no credential), and this
+package has no spelling for "a mutating route that needs no credential" —
+`allowPublic()` answers `500` there, deliberately. The gateway uses
+`createLaneDeriver` only; the declared mount above is what it would write if it
+ever authorized.
 
 ### Reading the identity
 
-The identity is published on `res.locals.identity`, and the subject is
-duplicated to `res.locals.actor` because automation-service's existing
-`detail.actor` recording reads that key by name. **`identityOf(res)`,
-`actorOf(res)`, `kindOf(res)` and `hasScope(res, scope)` are the supported
-accessors** — read `res.locals` directly and you are relying on key names this
-package may change.
+`identityOf(res)`, `actorOf(res)`, `kindOf(res)`, `hasScope(res, scope)` and
+`requirementOf(res)` are the **only** accessors. The values live under
+module-private Symbols, so there is no `res.locals` key to read instead — and
+none of it appears in `Object.keys(res.locals)` or a `JSON.stringify` of it.
+There is deliberately no second copy of `kind`: a knob fence is
+`kindOf(res) === "machine"`, never a look at the `sub` prefix.
 
-**There is deliberately no `res.locals.kind`.** It existed and was removed: a
-second copy of the center's answer is a second thing to keep true, and the one
-failure this package exists to prevent is a service deriving `kind` for
-itself. `kindOf(res)` reads `res.locals.identity`, and that is the whole story.
-A knob-class fence is `kindOf(res) === "machine"`, never a look at the subject
-prefix and never a check for the presence of a header, because after decision
-21 every caller presents one.
+## Reference
 
-**Use `secured()` or `guard()`, not both on the same route.** Each one
-authorizes, so a route covered by both asks the center twice for one request.
+### API
 
-### Lane policy — st-gateway's shape
-
-A separate export, so nothing adopts it by accident. It never rejects, never
-throws and never answers `503`: anything other than an active `operator` is
-`background`, including a center that does not answer. A gateway that failed
-closed would take the public read surface down with auth-service.
-
-```ts
-import { createLaneDeriver } from "@v-m-pioneer-trading/introspection-client";
-
-const deriver = createLaneDeriver(config);
-const lane = await deriver.derive(req.header("Authorization")); // "interactive" | "background"
-```
-
-### Framework-agnostic core
-
-`createAuthorizer(config).authorize({ method, requires, authorization })`
-returns a `Decision` and touches no framework. It is the fixture's forty-five
-cases and nothing else. The Express adapter is a translation over it that adds
-the one thing a fixture cannot reach — binding a requirement to a route; a
-`mux` wrapper would have to add the same.
-
-## Environment
-
-| Variable | Meaning |
+| Export | What it is |
 |---|---|
-| `AUTH_INTROSPECTION_URL` | The **full** endpoint URL, `/auth/v1/introspect` included — `http://localhost:3005/auth/v1/introspect` in production for the host-network services, `http://auth-service:3005/auth/v1/introspect` for st-gateway. POSTed to verbatim: never a base URL, never joined with a suffix. |
-| `AUTH_INTROSPECTION_SECRET` | The caller secret, sent as `X-Introspection-Secret`. Never the vault's `AUTH_SERVICE_SHARED_SECRET`. |
+| `createExpressAuth(config \| introspector \| authorizer)` | `requireScope(scope)`, `requireSession()`, `allowPublic()`, `guard(requirement \| resolver)` |
+| `secured(routerOrAppOrRoute)` | Patches in place; enforces the registration rules. Idempotent |
+| `passthrough(handler, why)` | Brands middleware that never answers |
+| `notFound(handler)` | Brands the terminal 404; only an error handler may follow it |
+| `identityOf` / `actorOf` / `kindOf` / `hasScope` / `requirementOf` | The accessors |
+| `createAuthorizer(config \| introspector)` | The framework-agnostic policy: `authorize({ method, requires, authorization })` |
+| `createLaneDeriver(config \| introspector)` | st-gateway's lane policy |
+| `createIntrospector(config)`, `splitScopes`, `bearerFrom`, `isSafeMethod` | The pieces underneath |
+| `loadIntrospectionConfig(env?)`, `IntrospectionConfigError` | Startup validation |
+| `MESSAGES`, `SECRET_HEADER`, `ENV_URL`, `ENV_SECRET`, `DEFAULT_TIMEOUT_MS`, `DEFAULT_MAX_RESPONSE_BYTES` | Constants |
 
-Both are required. A missing or blank value, a non-`http(s)` URL, or a URL
-carrying a query string all refuse to start, and no message ever contains the
-secret.
+`requireScope` throws at startup for `""`, whitespace, `"none"` and
+`"session"`: the last two are the reserved words for the other two intents, and
+spelled as a scope each read as a demand while silently producing its opposite.
 
-## Behaviour
+### Behaviour
 
 Rows are in evaluation order, and the first is first for a reason.
 
 | Situation | Answer | Center called |
 |---|---|---|
 | **Mutating** route declaring `"none"` | `500` `this route declares no required scope` | **no** |
-| An **undeclared** route — a resolver that returned `undefined` or threw — on any method | `500` `this route declares no required scope` | **no** |
+| An **undeclared** route, on any method | `500` `this route declares no required scope` | **no** |
 | No `Authorization`, **safe** method declaring `"none"` | proceeds as a visitor, identity `null` | **no** |
 | `Authorization` that is not `Bearer <something>` | `401` `a bearer token is required` | **no** |
 | No `Authorization`, route declaring a session or a scope | `401` `a bearer token is required` | **no** |
@@ -219,223 +232,99 @@ Rows are in evaluation order, and the first is first for a reason.
 | Active, route's scope present | proceeds with `{sub, kind, scopes}` | yes |
 | Center unreachable, timed out, non-2xx, malformed, or rejecting our secret | `503` `the authentication service could not process this request` | yes |
 
-Every rejection uses the `{"error":{"message":…}}` envelope. `scope` is split
-on whitespace **runs** with empties discarded, matching `strings.Fields`,
-`/\s+/` and `\s+` in the other implementations. `kind` is the center's answer,
-used verbatim and never re-derived from the `sub` prefix — that convention now
-lives in exactly one place.
+Every rejection uses the `{"error":{"message":…}}` envelope. Methods and the
+bearer scheme are compared **case-insensitively**; scope literals **exactly** —
+not by prefix, not by namespace walk, not case-folded — so `fleet:control:read`
+and `FLEET:CONTROL` both fail a route requiring `fleet:control`. `scope` is
+split on whitespace **runs** with empties discarded, matching
+`strings.Fields`, `/\s+/` and `\s+` in the other implementations. `kind` is the
+center's answer, used verbatim. `GET`, `HEAD` and `OPTIONS` are RFC 9110
+§9.2.1's safe methods (`meta` fixture `version: 2`, owner's delegate
+2026-09-21).
 
-## Security model
+### Environment
 
-Four rules. They are stated flatly because each one was arrived at by getting
-it wrong first.
+| Variable | Meaning |
+|---|---|
+| `AUTH_INTROSPECTION_URL` | The **full** endpoint URL, `/auth/v1/introspect` included. POSTed to verbatim: never a base URL, never joined with a suffix |
+| `AUTH_INTROSPECTION_SECRET` | The caller secret, sent as `X-Introspection-Secret`. Never the vault's `AUTH_SERVICE_SHARED_SECRET` |
 
-**P1. A route with no declaration is never served — for any method, including
-`GET`, `HEAD` and `OPTIONS`.** "Public" is a thing a route says out loud with
-`allowPublic()`, never a thing that happens because a lookup missed. A
-resolver that returns `undefined` or throws is *undeclared*, which is `500
-this route declares no required scope`, decided before the `Authorization`
-header is read and without calling the center. There is no fallback to
-`"none"` anywhere in this package or in this document.
+Both are required. A blank value, a non-`http(s)` URL, a URL with a query
+string, or a missing `globalThis.fetch` all refuse to start — the alternative
+being a `503` on every credentialed request that reads as an auth outage — and
+no message ever contains the secret.
 
-> This is an **adapter** rule about missing declarations, and it is not the
-> same thing as the fixture's `requires: "none"`. `"none"` is a route that
-> *declared* no credential is needed; the core's behaviour for it is unchanged
-> and is still exactly the fixture's. "Undeclared" has no representation in
-> the fixture at all.
+### Lane policy — st-gateway's shape
 
-**P2. Route matching is Express's job.** Declarations live at registration, so
-Express's own matcher binds a requirement to the same route it binds the
-handler to. A prefix-mounted router, a trailing slash, a case-variant path and
-a `:parameter` are then not this package's problem, because they never become
-a string it has to look up. `secured()` makes the rule unforgettable by
-refusing an undeclared registration at **startup** rather than detecting one
-per request. A resolver keyed on the **method alone** is still supported for
-generated routers — it is path-independent, so there is nothing for it to get
-wrong. A resolver keyed on a path is not supported and no longer documented.
-
-**P3. A declared requirement is enforced identically for every method.**
-`OPTIONS` and `HEAD` included, and `app.all` handlers included. `HEAD` is
-governed by its `GET` route's declaration, which under P2 falls out rather
-than being arranged: Express dispatches `HEAD /x` to the `GET /x` route, and
-the declaration is a handler on that route. The safe methods are exempt from
-**default-deny** — a route that declared `"none"` serves them to a visitor —
-and from nothing else. `HEAD` with no credential on a guarded route is the
-same `401` as `GET`; `OPTIONS` on a guarded `app.all` route is too, and it has
-to be, because that route answers an `OPTIONS` with the real handler.
-
-**P4. CORS preflight works because `cors()` terminates it, not because the
-guard waves it through.** All three consumers mount `cors()` as their first
-middleware, which answers the preflight before anything else sees it.
-**Mount `cors()` before the guard and before the secured router.** Mounted
-after, the preflight never reaches it: an Express router answers an `OPTIONS`
-that matches a path but no method *itself*, with a `200` and an `Allow`
-header and no `Access-Control-Allow-Origin`, so the browser fails the
-preflight. A test pins both orders and that failure mode, so the remedy is
-known to be the mount order rather than an exemption for `OPTIONS`.
-
-### What this package does **not** protect
-
-A fence whose gaps are unknown is worse than no fence.
-
-- **Anything mounted before the guard or the secured router.** It answers
-  without ever reaching them. A body parser is fine there; a route is not.
-- **Handlers registered on the app rather than on a secured router**, and
-  handlers registered through a reference to the raw router captured before
-  `secured()` wrapped it. `secured()` patches one object; it does not follow
-  aliases.
-- **What a `passthrough()` actually does.** It is the author's word that a
-  handler is middleware and will never answer. That is why it takes a written
-  reason.
-- **A second copy of this package in one process.** `secured()` would not
-  recognise the other copy's declarations — which surfaces as a refusal to
-  start, not as a hole, but it surfaces.
-- **Anything after the guard runs.** This package decides whether a request
-  may proceed; it does not check what the handler then does with the identity.
-  A knob fence, a tenant check, an ownership check are the handler's.
-- **The method, if something upstream rewrote it.** See below.
-
-### Method handling
-
-`GET`, `HEAD` and `OPTIONS` are the safe methods of RFC 9110 §9.2.1 and are
-exempt from **default-deny** (owner's delegate, 2026-09-21; `meta` fixture
-`version: 2`). Method names are compared **case-insensitively**, and so is the
-bearer **scheme**. Scope literals are compared **exactly** — not by prefix, not
-by namespace walk, not case-folded — so `fleet:control:read` and
-`FLEET:CONTROL` both fail a route requiring `fleet:control`.
-
-**The guard trusts `req.method` and reads no override header.**
-`X-HTTP-Method-Override` is ignored, and a test pins that it is: if it were
-honoured, a `POST` could present itself as a `GET` and claim a read's
-requirement. If a service does use a method-override middleware, **mount it
-before the guard**, so that by the time the guard runs `req.method` is the
-method the request will actually be handled as. Mounted after, the requirement
-is decided about one method and the route runs as another.
-
-## Security notes
-
-- **The token is never parsed, decoded, logged or inspected.** It is an opaque
-  string that goes into a form body. It travels in the body and never in a URL,
-  where an access log would keep it.
-- **The secret is never logged, and never leaves the configured host.**
-  Redirects are not followed (`redirect: "manual"`), so a `Location` header
-  cannot carry `X-Introspection-Secret` somewhere else; a `3xx` is simply not a
-  `2xx` and fails closed.
-- **Nothing in this package logs at all**, which is how "absent from every log
-  line" is achieved rather than promised. Errors are swallowed at the boundary
-  instead of wrapped, because a wrapped fetch error carries the URL.
-- **One call, a 1 s timeout, zero retries, no cache.** A retry against a center
-  that is down doubles the latency of every failing request and changes
-  nothing; a cache is a second verification path with a different answer and
-  would make revocation meaningless for its lifetime.
-- **Fail closed, and `503` never leaks upstream detail.** A center that answers
-  `401` about *our* caller secret surfaces as `503`, never as `401` — relaying
-  it would tell an operator their session expired and send them to sign in
-  again, forever, against a service that cannot accept them.
-- **A partial or wrongly typed answer is `503`, not `active: false`.** A
-  half-deployed center must not become a fleet-wide `401` storm.
-- **The response body is read under a 64 KiB cap** and abandoned past it.
-- **A malformed `Authorization` header is never repaired.** `"Bearer"`,
-  `"Bearer "`, `"Bearer abc def"` and two `Authorization` headers (which
-  Express joins into `"Bearer a, Bearer b"`) all read as *no credential*: the
-  header must be exactly the scheme plus one token. Joining the remainder
-  would invent a credential nobody issued and send it to the center.
-- **The token is URL-encoded into the form body**, so `&`, `=`, `+`, `%` and
-  CR/LF arrive byte-identical and cannot inject a field or a header.
-- **A guard that cannot do its job fails closed.** An injected introspector
-  that rejects or throws calls `next(error)` — never bare `next()`, which
-  would run the handler the guard just failed to authorize — and a resolver
-  that throws answers `500` on **every** method. A resolver that throws has
-  told us nothing about the route, and neither `"none"` nor `"session"` is a
-  thing to guess in its place.
-
-### Gateway latency, and the `timeoutMs` knob
-
-**`createLaneDeriver` awaits the center.** A *hanging* center therefore adds up
-to `timeoutMs` to every **credentialed** request st-gateway proxies — the lane
-is still `background` and the request still goes through, but it goes through
-late. **Anonymous requests are unaffected**: no credential means nothing to
-introspect, so the center is never on the hot path of the public map, and
-neither is a `Basic` header or a `"Bearer "` with no token.
-
-`timeoutMs` is configurable on every entry point, including the lane deriver,
-and **defaults to 1000 ms** (the fixture's `clientTimeoutMs`). st-gateway may
-pass something shorter — it is a proxy, and how much latency an auth outage is
-allowed to add to its own hot path is its decision, not this package's:
+A separate export, so nothing adopts it by accident. It never rejects, never
+throws and never answers `503`: anything other than an active `operator` is
+`background`, including a center that does not answer, because a gateway that
+failed closed would take the public read surface down with auth-service.
 
 ```ts
 const deriver = createLaneDeriver({ ...config, timeoutMs: 250 });
+const lane = await deriver.derive(req.header("Authorization")); // "interactive" | "background"
 ```
 
-A test bounds the elapsed time against a stub that accepts the connection and
-never answers, so an unbounded wait is a red test rather than a production
-stall.
+**It awaits the center**, so a *hanging* one adds up to `timeoutMs` to every
+**credentialed** request the gateway proxies; anonymous requests are unaffected,
+since nothing to introspect keeps the center off the hot path of the public map.
+`timeoutMs` defaults to 1000 ms (the fixture's `clientTimeoutMs`), a proxy may
+reasonably pass less, and a test bounds the elapsed time against a stub that
+never answers.
+
+### Security notes
+
+- **The token is never parsed, decoded, logged or inspected**, and nothing in
+  this package logs at all. It is URL-encoded into a form body — never a URL,
+  where an access log would keep it. Errors are swallowed at the boundary
+  rather than wrapped, because a wrapped fetch error carries the URL.
+- **Redirects are not followed** (`redirect: "manual"`), so a `Location` header
+  cannot carry `X-Introspection-Secret` to another host.
+- **One call, a 1 s timeout, zero retries, no cache.** A retry against a center
+  that is down doubles the latency of every failing request and changes nothing.
+- **`503` never leaks upstream detail**, including the center's own `401` about
+  *our* caller secret — relaying that would tell an operator to sign in again,
+  forever, against a service that cannot accept them. A partial or wrongly
+  typed answer is `503` rather than `active: false`, so a half-deployed center
+  does not become a fleet-wide `401` storm, and the body is read under a 64 KiB
+  cap.
+- **A malformed `Authorization` header is never repaired.** `"Bearer"`,
+  `"Bearer "`, `"Bearer abc def"` and two `Authorization` headers (Express joins
+  them into `"Bearer a, Bearer b"`) all read as *no credential*.
+- **A guard that cannot do its job fails closed.** An injected introspector that
+  rejects or throws calls `next(error)` — never bare `next()`, which would run
+  the handler the guard just failed to authorize.
 
 ## Development
 
 ```sh
-npm ci
-npm run typecheck   # ts-jest only checks what a test imports
-npm run build
-npm test
+npm ci && npm run typecheck && npm run build && npm test
 ```
 
-### Re-vendoring the fixture
+CI additionally packs the tarball, installs it into a scratch project and
+typechecks two probes with `skipLibCheck: false` — one without
+`@types/express` (the core claim), one with a real Express app (the adapter
+claim) — then proves the registration rules against the **packed** tarball at
+runtime, because a typecheck cannot see them.
 
-`meta` owns the fixture; this repository holds a copy so that drift shows up in
-a diff. Change `meta` first, then:
+**Re-vendoring the fixture.** `meta` owns it and this repository holds a copy so
+drift shows in a diff, so change `meta` first; the exact commands and the
+current provenance live in [`test/fixtures/SOURCE`](test/fixtures/SOURCE).
+`meta` runs [`scripts/validate-fixtures.mjs`][validate] on every PR, and the
+suite here recomputes the hash, asserts the sorted case names and **fails on an
+unknown assertion key**, so a case added upstream is a red test rather than one
+quietly skipped.
 
-```sh
-git -C ../meta show HEAD:fixtures/introspection.json > test/fixtures/introspection.json
-node -e "const c=require('crypto'),f=require('fs');const b=f.readFileSync('test/fixtures/introspection.json');console.log(b.length,c.createHash('sha256').update(b).digest('hex'))"
-```
-
-Then update the commit, date, version, byte count and sha256 in
-[`test/fixtures/SOURCE`](test/fixtures/SOURCE).
-
-> **The vendored copy currently points at an unmerged pull-request head**
-> ([meta#84](https://github.com/V-M-Pioneer-Trading/meta/pull/84), the
-> `feat/fixture-safe-methods` branch), because this package implements the
-> safe-method rule and cannot honestly point at a commit that predates it.
-> It has moved once already, from that branch's first head to its second, when
-> the review of this package produced four more fixture cases — a copy that
-> leads its original is drift pointing the other way, so `meta` changed first
-> and this followed. When the PR merges, re-point `SOURCE` at the squash
-> commit on `main`. The bytes do not change then: only the `meta commit` line
-> moves, and the sha256 must come out identical.
-
-`meta` also runs [`scripts/validate-fixtures.mjs`][validate] on every PR, which
-checks the things a conformance suite structurally cannot check about its own
-source of truth — messages that are not `contract.messages` values, a status
-paired with the wrong sentence, an identity that disagrees with the center body
-it is derived from, an assertion key nobody asserts. Change the fixture there
-and that runs before this ever sees it.
-
-The suite recomputes the hash
-on every run, asserts the sorted list of case names, and **fails on an unknown
-assertion key** — so a case added upstream is a red test rather than a case
-quietly skipped. `.gitattributes` marks the copy `-text` so no checkout ever
-translates its line endings.
-
-### Releasing
-
-Tests must be green on `main` first. Then bump `version` in `package.json`,
-merge, and push a matching tag:
-
-```sh
-git tag v1.0.0 && git push origin v1.0.0
-```
-
-The release workflow refuses a tag that disagrees with `package.json`, builds,
-typechecks, tests, `npm pack`s and attaches the `.tgz` to a GitHub Release.
-`contents: write` lives on that one job; the workflow itself is
-`contents: read`. Consumers then bump the release URL they install.
+**Releasing.** Green on `main`, bump `version`, merge, push a matching tag
+(`git tag v1.0.0 && git push origin v1.0.0`). The release workflow refuses a
+tag that disagrees with `package.json`, then builds, tests, packs and attaches
+the `.tgz` to a GitHub Release; `contents: write` lives on that one job.
 
 ## Licence
 
-MIT — see [LICENSE](LICENSE). No other repository in this organisation carries
-one; MIT was chosen here because this package is installed from a public URL by
-builds outside its own repository.
+MIT — see [LICENSE](LICENSE). Chosen here because this package is installed
+from a public URL by builds outside its own repository.
 
 [d21]: https://github.com/V-M-Pioneer-Trading/meta/blob/main/docs/design/auth-design.md#21-one-verifier-every-service-asks-auth-service-what-a-token-carries
 [fixture]: https://github.com/V-M-Pioneer-Trading/meta/blob/main/fixtures/introspection.json
