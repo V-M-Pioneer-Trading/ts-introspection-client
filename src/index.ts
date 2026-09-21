@@ -5,7 +5,10 @@
  *
  * - {@link createAuthorizer} — the framework-agnostic policy, the thirty-one
  *   calling-service cases of `meta/fixtures/introspection.json`.
- * - {@link createExpressAuth} — the Express 4 adapter over it.
+ * - {@link createExpressAuth} — the Express 4 adapter over it, whose
+ *   declarations live at route registration so Express's own matcher binds
+ *   them, and whose {@link secured} wrapper refuses **at startup** to register
+ *   a route that carries none.
  * - {@link createLaneDeriver} — st-gateway's lane policy, which never rejects
  *   and is kept apart so nothing adopts it by accident.
  */
@@ -50,10 +53,13 @@ export type {
 export {
   actorOf,
   createExpressAuth,
+  declarationOf,
   hasScope,
   identityOf,
   kindOf,
   LOCALS_ACTOR,
   LOCALS_IDENTITY,
   LOCALS_REQUIRES,
+  passthrough,
+  secured,
 } from "./express";

@@ -1,23 +1,26 @@
 introspection.json is vendored verbatim. It is not maintained here.
 
   original    V-M-Pioneer-Trading/meta, path fixtures/introspection.json
-  meta commit 45b13ebdd0f2f3680539e9f47514d8db4669d943
-  blob        b9456ed6c0be1a15ba7df6fbb2999578d3aad828
+  meta commit ea0301664cc369064f7a41af41ce0691c47e25df
+  blob        e1399314dee4aec96e93c7a004a7126c4a2e5a6f
   vendored    2026-09-21
   version     2
-  bytes       39520
-  sha256      d64baac540906202d6ad633d0d5f23273510109499c4c5b556d18b8bd486c837
+  cases       35 calling-service + 10 gateway = 45
+  bytes       46238
+  sha256      e605f62b820129068acbaef5d67af9b49df9fcf2247d0319ec4f9196338ea3a8
 
 THE COMMIT ABOVE IS AN UNMERGED PULL-REQUEST HEAD, not a commit on meta's
-main: V-M-Pioneer-Trading/meta#84, the branch `feat/fixture-safe-methods`.
-It is recorded that way deliberately — this package implements the
-safe-method rule and cannot honestly point at a commit that predates it —
-but it is a temporary state. **When meta#84 merges, re-point this record at
-the squash commit on main.** The bytes do not change when it does: main's
-squash commit carries the same blob, so `blob`, `bytes` and `sha256` above
-stay exactly as they are and only the `meta commit` line moves. If that
-re-point ever changes the sha256, the two are not the same fixture and
-something was edited during the merge.
+main: V-M-Pioneer-Trading/meta#84, the branch `feat/fixture-safe-methods`,
+and it is that branch's **second** head — the first review of this package
+produced four more fixture cases, so the record moved from `45b13eb` to
+`ea03016` and the sha256 moved with it. It is recorded as a PR head
+deliberately — this package implements the safe-method rule and cannot
+honestly point at a commit that predates it — but it is a temporary state.
+**When meta#84 merges, re-point this record at the squash commit on main.**
+The bytes do not change when it does: main's squash commit carries the same
+blob, so `blob`, `bytes` and `sha256` above stay exactly as they are and only
+the `meta commit` line moves. If that re-point ever changes the sha256, the
+two are not the same fixture and something was edited during the merge.
 
 The sha256 is over the LF bytes of the blob as git stores it, which is what
 `git show <commit>:fixtures/introspection.json` prints. test/conformance.test.ts

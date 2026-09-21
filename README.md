@@ -10,10 +10,10 @@ what the token carries and compares the answer against what their own route
 declares. This package is that client for the three Node services
 (fleet-service, automation-service, st-gateway), and its behaviour is not
 described here but *fixed* by [`fixtures/introspection.json`][fixture] in the
-`meta` repository — thirty-one conditions for a calling service and ten more
+`meta` repository — thirty-five conditions for a calling service and ten more
 for st-gateway's queue lane, each with the center's response and the exact
 status, message, identity and call count expected. That file is vendored into
-`test/fixtures/` and the conformance suite drives all forty-one of its cases
+`test/fixtures/` and the conformance suite drives all forty-five of its cases
 against a real local HTTP stub.
 
 Zero runtime dependencies, and **no peer dependencies at all** — not even
@@ -54,34 +54,102 @@ import { loadIntrospectionConfig } from "@v-m-pioneer-trading/introspection-clie
 const config = loadIntrospectionConfig(); // throws, naming the missing variable
 ```
 
-### 1. Router-level guard — fleet-service's shape
+### Declare at the route, and let Express bind it
 
-One `use`, mounted once, with a resolver that maps a request to what its route
-declares. **The fallback must be `"none"`**: that is what makes a mutating
-route nobody guarded answer `500` instead of running.
+A route says what it needs where it is registered. Express's own matcher then
+binds the declaration to exactly the route it binds the handler to — so a mount
+prefix, a trailing slash, a case-variant path, a `:parameter` and a `HEAD`
+arriving at its `GET` route all resolve the way the route does, because they
+*are* the route.
 
-```ts
-import { actorOf, createExpressAuth } from "@v-m-pioneer-trading/introspection-client";
-
-const auth = createExpressAuth(config);
-const table: Record<string, string> = {
-  "POST /ships/navigate": "fleet:control",
-  "GET /cooldown": "session",
-};
-
-router.use(auth.guard((req) => table[`${req.method} ${req.path}`] ?? "none"));
-router.post("/ships/navigate", (_req, res) => res.json({ by: actorOf(res) }));
-```
-
-### 2. Per-route guards — automation-service's shape
+`secured()` is the half that cannot be forgotten: it refuses, **at
+registration time**, to register a handler that carries no declaration. The
+process does not start. An undeclared route does not exist, rather than
+existing and being noticed the first time somebody asks for it.
 
 ```ts
-const auth = createExpressAuth(config);
+import {
+  actorOf,
+  createExpressAuth,
+  passthrough,
+  secured,
+} from "@v-m-pioneer-trading/introspection-client";
 
-app.get("/health", auth.allowPublic(), handler);
-app.get("/targets", auth.requireSession(), handler);
-app.post("/targets", auth.requireScope("fleet:control"), handler);
+const auth = createExpressAuth(config);
+const api = secured(express.Router());
+
+api.use(passthrough(express.json(), "parses bodies; never answers"));
+
+api.get("/health", auth.allowPublic(), health);
+api.get("/targets", auth.requireSession(), listTargets);
+api.get("/targets/:id", auth.requireSession(), readTarget);
+api.post("/targets", auth.requireScope("fleet:control"), (_req, res) => {
+  res.json({ by: actorOf(res) });
+});
+
+app.use("/api/automation/v1", api);
 ```
+
+Leave a declaration off and the service refuses to boot:
+
+```
+router.get(/ships/:id) was registered without an authorization declaration.
+
+Every route must say what it needs, at the point it is registered:
+
+    auth.allowPublic()                 — anyone, including an anonymous visitor
+    auth.requireSession()              — any verified session
+    auth.requireScope("fleet:control") — a session carrying that scope
+
+If this handler is middleware rather than a route — a body parser, CORS, a
+logger — wrap it: passthrough(handler, "why it never answers").
+```
+
+`secured()` patches the router in place and returns it, so it is still an
+`express.Router` in every other respect: mount it, nest it (nest `secured()`
+routers inside each other), chain `route()`. `use()` accepts a declaration, a
+`guard()`, another secured router, an error handler, or a `passthrough()` —
+and nothing else, because from the outside a middleware and a route are the
+same shape and only the author knows which one will answer.
+
+**`allowPublic()` is how a route becomes public, and the only way.** A route
+nobody declared is not public; it is undeclared, and undeclared fails closed.
+
+### Generated routers — fleet-service's shape
+
+fleet-service's routes come out of tsoa. There is no call site to put a
+declaration in, so it keeps a router-level guard:
+
+```ts
+const api = express.Router();
+api.use(auth.guard((req) => (req.method === "GET" ? "session" : "fleet:control")));
+RegisterRoutes(api);
+app.use("/api/fleet/v1", api);
+```
+
+**That resolver is a function of the method and nothing else, and that is the
+point.** A `use`-mounted middleware runs *before* any route layer matches, so
+`req.route` is `undefined` there and no honest path key exists: `req.path` is
+the path after the mount prefix, it has not been through Express's matcher,
+and reconstructing what Express would have matched is the thing this package
+stopped trying to do. Key on the method, or declare at the route.
+
+A resolver that returns `undefined`, or throws, means **undeclared**: `500
+this route declares no required scope`, on every method including `GET`,
+before the `Authorization` header is read. There is no `?? "none"` to write,
+and there is deliberately no way to spell "I could not find this route, serve
+it anyway".
+
+The resolver is handed `method`, `path`, `baseUrl`, `originalUrl`, `header()`
+and — when a route has matched, which for a `use` mount it has not —
+`route.path`. `baseUrl` and `originalUrl` are there so a diagnostic can name
+the whole path; they are not a route key.
+
+On a `HEAD`, the resolver is called with `method` reading `"GET"`, because
+`HEAD /x` is the same route as `GET /x` and Express dispatches it there. The
+real `req.method` is never mutated.
+
+### Reading the identity
 
 The identity is published on `res.locals.identity`, and the subject is
 duplicated to `res.locals.actor` because automation-service's existing
@@ -98,12 +166,10 @@ A knob-class fence is `kindOf(res) === "machine"`, never a look at the subject
 prefix and never a check for the presence of a header, because after decision
 21 every caller presents one.
 
-**Per-route guards alone cannot give default-deny** — a route with no guard has
-nothing to run — so a service using them must *also* mount `auth.guard()`
-router-level. This is stated rather than hidden: default-deny is the part of
-decision 21 that makes an unguarded `POST` structurally impossible.
+**Use `secured()` or `guard()`, not both on the same route.** Each one
+authorizes, so a route covered by both asks the center twice for one request.
 
-### 3. Lane policy — st-gateway's shape
+### Lane policy — st-gateway's shape
 
 A separate export, so nothing adopts it by accident. It never rejects, never
 throws and never answers `503`: anything other than an active `operator` is
@@ -120,8 +186,10 @@ const lane = await deriver.derive(req.header("Authorization")); // "interactive"
 ### Framework-agnostic core
 
 `createAuthorizer(config).authorize({ method, requires, authorization })`
-returns a `Decision` and touches no framework. The Express adapter is a thin
-translation over it; a `mux` wrapper would be another.
+returns a `Decision` and touches no framework. It is the fixture's forty-five
+cases and nothing else. The Express adapter is a translation over it that adds
+the one thing a fixture cannot reach — binding a requirement to a route; a
+`mux` wrapper would have to add the same.
 
 ## Environment
 
@@ -141,7 +209,7 @@ Rows are in evaluation order, and the first is first for a reason.
 | Situation | Answer | Center called |
 |---|---|---|
 | **Mutating** route declaring `"none"` | `500` `this route declares no required scope` | **no** |
-| A resolver that throws, on any method | `500` `this route declares no required scope` | **no** |
+| An **undeclared** route — a resolver that returned `undefined` or threw — on any method | `500` `this route declares no required scope` | **no** |
 | No `Authorization`, **safe** method declaring `"none"` | proceeds as a visitor, identity `null` | **no** |
 | `Authorization` that is not `Bearer <something>` | `401` `a bearer token is required` | **no** |
 | No `Authorization`, route declaring a session or a scope | `401` `a bearer token is required` | **no** |
@@ -157,55 +225,92 @@ on whitespace **runs** with empties discarded, matching `strings.Fields`,
 used verbatim and never re-derived from the `sub` prefix — that convention now
 lives in exactly one place.
 
-## Method handling
+## Security model
 
-**Default-deny applies to mutating methods only.** `GET`, `HEAD` and `OPTIONS`
-are the safe methods of RFC 9110 §9.2.1 and are exempt from it (owner's
-delegate, 2026-09-21; `meta` fixture `version: 2`). Method names are compared
-**case-insensitively**; scope literals are compared **exactly** — not by
-prefix, not by namespace walk, not case-folded, so `fleet:control:read` and
+Four rules. They are stated flatly because each one was arrived at by getting
+it wrong first.
+
+**P1. A route with no declaration is never served — for any method, including
+`GET`, `HEAD` and `OPTIONS`.** "Public" is a thing a route says out loud with
+`allowPublic()`, never a thing that happens because a lookup missed. A
+resolver that returns `undefined` or throws is *undeclared*, which is `500
+this route declares no required scope`, decided before the `Authorization`
+header is read and without calling the center. There is no fallback to
+`"none"` anywhere in this package or in this document.
+
+> This is an **adapter** rule about missing declarations, and it is not the
+> same thing as the fixture's `requires: "none"`. `"none"` is a route that
+> *declared* no credential is needed; the core's behaviour for it is unchanged
+> and is still exactly the fixture's. "Undeclared" has no representation in
+> the fixture at all.
+
+**P2. Route matching is Express's job.** Declarations live at registration, so
+Express's own matcher binds a requirement to the same route it binds the
+handler to. A prefix-mounted router, a trailing slash, a case-variant path and
+a `:parameter` are then not this package's problem, because they never become
+a string it has to look up. `secured()` makes the rule unforgettable by
+refusing an undeclared registration at **startup** rather than detecting one
+per request. A resolver keyed on the **method alone** is still supported for
+generated routers — it is path-independent, so there is nothing for it to get
+wrong. A resolver keyed on a path is not supported and no longer documented.
+
+**P3. A declared requirement is enforced identically for every method.**
+`OPTIONS` and `HEAD` included, and `app.all` handlers included. `HEAD` is
+governed by its `GET` route's declaration, which under P2 falls out rather
+than being arranged: Express dispatches `HEAD /x` to the `GET /x` route, and
+the declaration is a handler on that route. The safe methods are exempt from
+**default-deny** — a route that declared `"none"` serves them to a visitor —
+and from nothing else. `HEAD` with no credential on a guarded route is the
+same `401` as `GET`; `OPTIONS` on a guarded `app.all` route is too, and it has
+to be, because that route answers an `OPTIONS` with the real handler.
+
+**P4. CORS preflight works because `cors()` terminates it, not because the
+guard waves it through.** All three consumers mount `cors()` as their first
+middleware, which answers the preflight before anything else sees it.
+**Mount `cors()` before the guard and before the secured router.** Mounted
+after, the preflight never reaches it: an Express router answers an `OPTIONS`
+that matches a path but no method *itself*, with a `200` and an `Allow`
+header and no `Access-Control-Allow-Origin`, so the browser fails the
+preflight. A test pins both orders and that failure mode, so the remedy is
+known to be the mount order rather than an exemption for `OPTIONS`.
+
+### What this package does **not** protect
+
+A fence whose gaps are unknown is worse than no fence.
+
+- **Anything mounted before the guard or the secured router.** It answers
+  without ever reaching them. A body parser is fine there; a route is not.
+- **Handlers registered on the app rather than on a secured router**, and
+  handlers registered through a reference to the raw router captured before
+  `secured()` wrapped it. `secured()` patches one object; it does not follow
+  aliases.
+- **What a `passthrough()` actually does.** It is the author's word that a
+  handler is middleware and will never answer. That is why it takes a written
+  reason.
+- **A second copy of this package in one process.** `secured()` would not
+  recognise the other copy's declarations — which surfaces as a refusal to
+  start, not as a hole, but it surfaces.
+- **Anything after the guard runs.** This package decides whether a request
+  may proceed; it does not check what the handler then does with the identity.
+  A knob fence, a tenant check, an ownership check are the handler's.
+- **The method, if something upstream rewrote it.** See below.
+
+### Method handling
+
+`GET`, `HEAD` and `OPTIONS` are the safe methods of RFC 9110 §9.2.1 and are
+exempt from **default-deny** (owner's delegate, 2026-09-21; `meta` fixture
+`version: 2`). Method names are compared **case-insensitively**, and so is the
+bearer **scheme**. Scope literals are compared **exactly** — not by prefix, not
+by namespace walk, not case-folded — so `fleet:control:read` and
 `FLEET:CONTROL` both fail a route requiring `fleet:control`.
-
-- **`HEAD` is the same route as `GET`.** Express dispatches `HEAD /x` to the
-  `GET /x` handler, so the adapter calls your resolver with `req.method`
-  reading `"GET"` for a `HEAD`. A table keyed `"GET /cooldown"` therefore
-  governs `HEAD /cooldown` as well, with no second entry. Without that, a
-  `HEAD` would miss the table, fall back to `"none"` and serve a guarded
-  route's headers — which leak existence, sizes and `ETag`s — to an anonymous
-  caller. Exemption from *default-deny* is not exemption from a requirement
-  the route *declared*: `HEAD` with no credential on a guarded route is the
-  same `401` as `GET`.
-- **`OPTIONS` with no declared requirement proceeds as a visitor.** A CORS
-  preflight carries no `Authorization` header by definition.
-- **The real `req.method` is never mutated.** Only the object handed to the
-  resolver reads `"GET"`; your handlers, and the policy itself, still see the
-  `HEAD`.
-
-### Mounting cors
-
-Either order works and both are tested, but **mount `cors()` before the
-guard**:
-
-```ts
-app.use(cors());          // answers the preflight itself, 204
-app.use(auth.guard(...)); // never sees it
-```
-
-Mounted the other way the preflight reaches the guard first. That is fine —
-`OPTIONS` is safe, so it proceeds as a visitor and `cors()` answers — but it
-spends a middleware hop on every preflight and depends on the route resolving
-to `"none"` for `OPTIONS`. If a resolver ever returns a scope for an `OPTIONS`,
-the preflight gets a `401` the browser reports as a CORS failure.
-
-### Method override
 
 **The guard trusts `req.method` and reads no override header.**
 `X-HTTP-Method-Override` is ignored, and a test pins that it is: if it were
-honoured, a `POST` could present itself as a `GET` and walk straight past
-default-deny. If a service does use a method-override middleware, **mount it
+honoured, a `POST` could present itself as a `GET` and claim a read's
+requirement. If a service does use a method-override middleware, **mount it
 before the guard**, so that by the time the guard runs `req.method` is the
-method the request will actually be handled as. Mounted after, default-deny is
-decided about one method and the route runs as another.
+method the request will actually be handled as. Mounted after, the requirement
+is decided about one method and the route runs as another.
 
 ## Security notes
 
@@ -292,9 +397,19 @@ Then update the commit, date, version, byte count and sha256 in
 > ([meta#84](https://github.com/V-M-Pioneer-Trading/meta/pull/84), the
 > `feat/fixture-safe-methods` branch), because this package implements the
 > safe-method rule and cannot honestly point at a commit that predates it.
-> When that PR merges, re-point `SOURCE` at the squash commit on `main`. The
-> bytes do not change: only the `meta commit` line moves, and the sha256 must
-> come out identical.
+> It has moved once already, from that branch's first head to its second, when
+> the review of this package produced four more fixture cases — a copy that
+> leads its original is drift pointing the other way, so `meta` changed first
+> and this followed. When the PR merges, re-point `SOURCE` at the squash
+> commit on `main`. The bytes do not change then: only the `meta commit` line
+> moves, and the sha256 must come out identical.
+
+`meta` also runs [`scripts/validate-fixtures.mjs`][validate] on every PR, which
+checks the things a conformance suite structurally cannot check about its own
+source of truth — messages that are not `contract.messages` values, a status
+paired with the wrong sentence, an identity that disagrees with the center body
+it is derived from, an assertion key nobody asserts. Change the fixture there
+and that runs before this ever sees it.
 
 The suite recomputes the hash
 on every run, asserts the sorted list of case names, and **fails on an unknown
@@ -324,3 +439,4 @@ builds outside its own repository.
 
 [d21]: https://github.com/V-M-Pioneer-Trading/meta/blob/main/docs/design/auth-design.md#21-one-verifier-every-service-asks-auth-service-what-a-token-carries
 [fixture]: https://github.com/V-M-Pioneer-Trading/meta/blob/main/fixtures/introspection.json
+[validate]: https://github.com/V-M-Pioneer-Trading/meta/blob/main/scripts/validate-fixtures.mjs

@@ -169,7 +169,8 @@ jobs:
             hasScope,
             identityOf,
             kindOf,
-            type RouteRequirement,
+            passthrough,
+            secured,
           } from "@v-m-pioneer-trading/introspection-client";
 
           const auth = createExpressAuth({
@@ -177,19 +178,23 @@ jobs:
             secret: "x",
           });
 
-          const table: Record<string, RouteRequirement> = {
-            "POST /ships/navigate": "fleet:control",
-            "GET /cooldown": "session",
-          };
-
           export const app = express();
+
+          // A secured router must still BE an express.Router to the compiler:
+          // `secured()` returns its argument's own type, so mounting, nesting
+          // and every Express signature survive it.
+          const api = secured(express.Router());
+          api.use(passthrough(express.json(), "parses bodies; never answers"));
+
           // No cast anywhere: the locally declared handler type has to be
-          // structurally acceptable to a real Express app.
-          app.use(auth.guard((req) => table[`${req.method} ${req.path}`] ?? "none"));
-          app.get("/health", auth.allowPublic(), (_req, res) => {
+          // structurally acceptable to a real Express route registration.
+          api.get("/health", auth.allowPublic(), (_req, res) => {
             res.json({ actor: actorOf(res) });
           });
-          app.post("/targets", auth.requireScope("fleet:control"), (_req, res) => {
+          api.get("/targets/:id", auth.requireSession(), (_req, res) => {
+            res.json({ identity: identityOf(res) });
+          });
+          api.post("/targets", auth.requireScope("fleet:control"), (_req, res) => {
             res.json({
               actor: actorOf(res),
               kind: kindOf(res),
@@ -197,6 +202,35 @@ jobs:
               refreshes: hasScope(res, "universe:refresh"),
             });
           });
+          app.use("/api/automation/v1", api);
+
+          // The generated-router shape: a resolver keyed on the METHOD, which
+          // is path-independent and therefore safe. `undefined` means
+          // undeclared, and there is deliberately no `?? "none"` to write.
+          const generated = express.Router();
+          generated.use(
+            auth.guard((req) => (req.method === "GET" ? "session" : "fleet:control"))
+          );
+          app.use("/api/fleet/v1", generated);
           TS
           npx tsc -p tsconfig.express.json
           echo "the adapter typechecks against a real Express app with no cast"
+
+      # The claim that matters most about `secured()` is a RUNTIME one, and a
+      # typecheck cannot see it: an undeclared route must throw at startup.
+      # Proven against the packed tarball rather than the source tree, because
+      # that is what a consumer installs.
+      - name: Prove the tarball refuses an undeclared route at startup
+        run: |
+          cd /tmp/consumer
+          node -e "
+            const express = require('express');
+            const { createExpressAuth, secured } = require('@v-m-pioneer-trading/introspection-client');
+            const auth = createExpressAuth({ url: 'http://localhost:3005/auth/v1/introspect', secret: 'x' });
+            const api = secured(express.Router());
+            let threw = false;
+            try { api.get('/ships', (_req, res) => res.json({})); } catch { threw = true; }
+            if (!threw) throw new Error('an undeclared route was accepted');
+            api.get('/ships', auth.requireSession(), (_req, res) => res.json({}));
+            console.log('secured() refuses an undeclared route and accepts a declared one');
+          "

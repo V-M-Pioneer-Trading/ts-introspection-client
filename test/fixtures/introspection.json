@@ -1,5 +1,5 @@
 {
-  "$comment": "Canonical token-introspection conditions: what auth-service (the center) answers, and what a calling service must answer its own caller for each. Source of truth for the conformance tests in the TS introspection client package (fleet-service, automation-service, st-gateway), agent-service (Go) and navigation-service (Java), which vendor this file verbatim. See ../docs/design/token-introspection.md and auth-design.md decision 21. DECIDED 2026-09-20, NOT SHIPPED: no service behaves this way yet — rollout is meta#80. Assertion vocabulary: a case is a route declaration, an inbound Authorization header, a stubbed center, and the expected outcome. `route.requires` is \"none\" (no credential declared), \"session\" (any verified session) or a scope literal. `expect.outcome` is \"proceed\" (the middleware ran the handler) or \"reject\". `expect.identity` is the {sub, kind, scopes} handed to the handler, or null for a visitor; `kind` is the center's answer and must be used verbatim, never re-derived from the `sub` prefix, and `scopes` is the `scope` string split on whitespace RUNS with empties discarded, matching every verifier live today. `expect.centerCalls` is how many HTTP requests the client made to the center for this one inbound request — 0 and 1 are both assertions, and 2 fails. An unknown key in `expect` must fail the case rather than be skipped, or a copy that falls behind quietly checks less. No case may be satisfiable by an empty or absent answer: every rejection asserts its exact message, every proceed asserts the identity, and every case asserts the call count (meta#79).",
+  "$comment": "Canonical token-introspection conditions: what auth-service (the center) answers, and what a calling service must answer its own caller for each. Source of truth for the conformance tests in the TS introspection client package (fleet-service, automation-service, st-gateway), agent-service (Go) and navigation-service (Java), which vendor this file verbatim. See ../docs/design/token-introspection.md and auth-design.md decision 21. DECIDED 2026-09-20, NOT SHIPPED: no service behaves this way yet — rollout is meta#80. Assertion vocabulary: a case is a route declaration, an inbound Authorization header, a stubbed center, and the expected outcome. `route.requires` is \"none\" (no credential declared), \"session\" (any verified session) or a scope literal. `expect.outcome` is \"proceed\" (the middleware ran the handler) or \"reject\". `expect.identity` is the {sub, kind, scopes} handed to the handler, or null for a visitor; `kind` is the center's answer and must be used verbatim, never re-derived from the `sub` prefix, and `scopes` is the `scope` string split on whitespace RUNS with empties discarded, matching every verifier live today. `expect.centerCalls` is how many HTTP requests the client made to the center for this one inbound request — 0 and 1 are both assertions, and 2 fails. An unknown key in `expect` must fail the case rather than be skipped, or a copy that falls behind quietly checks less. No case may be satisfiable by an empty or absent answer: every rejection asserts its exact message, every proceed asserts the identity, and every case asserts the call count (meta#79). VERSION 2 (2026-09-21, owner's delegate) adds cases and changes none: default-deny applies to MUTATING methods only, `GET`, `HEAD` and `OPTIONS` being the safe methods of RFC 9110 §9.2.1, so a safe method on a route declaring \"none\" proceeds as a visitor instead of answering 500. `route.method` is the method the request will actually be handled as — never a method-override header, and for a framework that dispatches HEAD to the GET handler (Express does) a HEAD of a route declared for GET arrives here as the requirement GET declared. It is compared case-insensitively; scope literals are compared exactly, and the bearer scheme case-insensitively. THE EXEMPTION IS FROM DEFAULT-DENY ONLY: a safe method on a route that DID declare a session or a scope is enforced exactly as a POST is. Read \"none\" precisely: it means the route DECLARED that no credential is needed. It is not the same thing as a route an adapter could find no declaration for — \"undeclared\" has no representation in this file, and an adapter must treat a resolver miss as a loud failure (the 500 above) and never as \"none\". Everything about how an adapter binds a requirement to a route — prefix-mounted routers, trailing slashes, case-variant paths, parameterised paths, `app.all` handlers answering OPTIONS — is outside this file's reach and is the adapter's own obligation to test.",
   "version": 2,
   "contract": {
     "endpoint": {
@@ -403,7 +403,7 @@
     },
     {
       "name": "head-on-guarded-route-with-no-header",
-      "why": "The other half of the HEAD rule, and the one that matters: exempting HEAD from default-deny must not exempt it from a requirement a route DID declare. HEAD /x is governed by whatever GET /x declares, so a requirement keyed on \"GET /path\" must be found for a HEAD of the same path. A client that resolves requirements by literal method string finds nothing, falls back to \"none\", and hands an attacker a credential-free read of a guarded route's headers — response headers leak existence, sizes and ETags. 401, and the center is not asked.",
+      "why": "The other half of the HEAD rule: exempting HEAD from default-deny must not exempt it from a requirement a route DID declare. 401, and the center is not asked, because response headers leak existence, sizes and ETags and a credential-free read of them is the hole the exemption would otherwise open. Note what this case does NOT test. The fixture hands `route.requires` to the client directly, already resolved; it says nothing about how an adapter arrived at it. BINDING A REQUIREMENT TO THE RIGHT ROUTE IS AN ADAPTER OBLIGATION THE FIXTURE CANNOT REACH — that HEAD /x is governed by what GET /x declared, that a prefix-mounted router, a trailing slash, a case-variant path or a parameterised path still find their route's declaration, and above all that a route with NO declaration is never served. A client can pass every case here and still be wide open if its adapter resolves requirements by looking up a string it may miss. The remedy is to bind the declaration where the framework's own matcher binds the handler, and to refuse at startup to register a handler that carries none; see the adapter's own tests, not this file.",
       "route": { "method": "HEAD", "requires": "fleet:control" },
       "request": { "authorization": null },
       "center": { "notCalled": true },
@@ -479,6 +479,70 @@
         "outcome": "reject",
         "status": 401,
         "message": "a bearer token is required",
+        "centerCalls": 0
+      }
+    },
+    {
+      "name": "head-on-guarded-route-with-valid-token",
+      "why": "The positive half of the HEAD rule, and the one no other case can catch. `head-on-guarded-route-with-no-header` is satisfied by a client that simply answers 401 to every HEAD it ever sees — which would be a working conformance run and a broken service, because the operator's dashboard could then never issue a conditional read of a route it is fully entitled to. A HEAD carrying a token that satisfies the route's scope PROCEEDS, with the same identity a GET of that route would receive, and the center is called exactly once. Pinning only the refusal would have left \"401 everything\" green (meta#79 philosophy: a case an empty answer can satisfy is not a case).",
+      "route": { "method": "HEAD", "requires": "fleet:control" },
+      "request": { "authorization": "Bearer operator.token.fifteen" },
+      "center": {
+        "status": 200,
+        "body": "{\"active\":true,\"sub\":\"user_31qP8k2cQeXampleOperator\",\"scope\":\"fleet:control\",\"exp\":4102444800,\"kind\":\"operator\"}"
+      },
+      "expect": {
+        "outcome": "proceed",
+        "identity": {
+          "sub": "user_31qP8k2cQeXampleOperator",
+          "kind": "operator",
+          "scopes": ["fleet:control"]
+        },
+        "centerCalls": 1
+      }
+    },
+    {
+      "name": "options-on-guarded-route-with-no-header",
+      "why": "OPTIONS is exempt from DEFAULT-DENY, not from a requirement the route DECLARED — the same distinction `head-on-guarded-route-with-no-header` draws, and the one a client is most likely to get wrong for OPTIONS specifically, because the CORS story makes \"let every OPTIONS through\" sound reasonable. It is not: an `app.all(path, handler)` route answers OPTIONS with the real handler, so a client that skipped the requirement for OPTIONS would run a mutation for an anonymous caller. Preflight keeps working because the CORS middleware is mounted in front of the guard and terminates the preflight itself; it does not work by the guard abdicating. 401, and the center is not asked.",
+      "route": { "method": "OPTIONS", "requires": "fleet:control" },
+      "request": { "authorization": null },
+      "center": { "notCalled": true },
+      "expect": {
+        "outcome": "reject",
+        "status": 401,
+        "message": "a bearer token is required",
+        "centerCalls": 0
+      }
+    },
+    {
+      "name": "lowercase-bearer-scheme",
+      "why": "RFC 7235 makes the auth-scheme token case-insensitive, and `active-with-scope-differing-only-in-case` claims in so many words that the scheme and the method are the two case-insensitive comparisons in this policy while scope matching is not. That claim is now pinned rather than merely asserted (meta#79): `bearer <token>` in lower case is a credential, is forwarded to the center, and proceeds. A client that compared the scheme with `==` against \"Bearer\" would read this as no credential and answer 401 to a caller holding a perfectly good session.",
+      "route": { "method": "GET", "requires": "session" },
+      "request": { "authorization": "bearer operator.token.sixteen" },
+      "center": {
+        "status": 200,
+        "body": "{\"active\":true,\"sub\":\"user_31qP8k2cQeXampleOperator\",\"scope\":\"fleet:control\",\"exp\":4102444800,\"kind\":\"operator\"}"
+      },
+      "expect": {
+        "outcome": "proceed",
+        "identity": {
+          "sub": "user_31qP8k2cQeXampleOperator",
+          "kind": "operator",
+          "scopes": ["fleet:control"]
+        },
+        "centerCalls": 1
+      }
+    },
+    {
+      "name": "lowercase-route-method",
+      "why": "The other half of the same claim, on the method. `route.method` is an HTTP method token and is compared CASE-INSENSITIVELY: a framework hands a client whatever it parsed, and a client that compared case-sensitively would read \"post\" as a method it did not recognise. Which way that fails depends on how the comparison is written — a `method === \"GET\"` safe-list makes \"post\" mutating by accident and happens to be right, but a `SAFE.has(method)` miss written the other way round, or a mutating-method allow-list, serves \"post\" as if it were safe and walks an undeclared mutation straight past default-deny. Lower-case \"post\" on a route declaring nothing is the same 500 as \"POST\", decided before the header is read — hence a valid token here and `centerCalls` 0.",
+      "route": { "method": "post", "requires": "none" },
+      "request": { "authorization": "Bearer operator.token.seventeen" },
+      "center": { "notCalled": true },
+      "expect": {
+        "outcome": "reject",
+        "status": 500,
+        "message": "this route declares no required scope",
         "centerCalls": 0
       }
     }

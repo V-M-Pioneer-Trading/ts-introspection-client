@@ -1,5 +1,5 @@
 /**
- * @file All forty-one conditions of meta's introspection fixture.
+ * @file All forty-five conditions of meta's introspection fixture.
  *
  * Driven against a real local HTTP stub, one per case, so that what the client
  * sends is asserted on the wire and not against a mock of itself. Nothing here
@@ -51,7 +51,7 @@ describe("the vendored fixture", () => {
     // Belt and braces: if both the copy and SOURCE were edited together, this
     // literal still pins the bytes the implementation was reviewed against.
     expect(fixtureSha256()).toBe(
-      "d64baac540906202d6ad633d0d5f23273510109499c4c5b556d18b8bd486c837"
+      "e605f62b820129068acbaef5d67af9b49df9fcf2247d0319ec4f9196338ea3a8"
     );
   });
 
@@ -72,16 +72,20 @@ describe("the vendored fixture", () => {
       "center-times-out",
       "center-unreachable",
       "head-on-guarded-route-with-no-header",
+      "head-on-guarded-route-with-valid-token",
       "head-on-public-get",
       "inactive-token-on-guarded-route",
       "inactive-token-on-public-get",
       "kind-disagrees-with-sub-prefix",
+      "lowercase-bearer-scheme",
+      "lowercase-route-method",
       "mutating-route-with-no-declared-scope",
       "mutating-route-with-no-declared-scope-and-inactive-token",
       "mutating-route-with-no-declared-scope-and-no-header",
       "no-header-on-guarded-route",
       "non-bearer-scheme-on-guarded-route",
       "operator-on-public-get",
+      "options-on-guarded-route-with-no-header",
       "options-with-no-declared-scope",
       "session-route-with-inactive-token",
       "session-route-with-no-header",
@@ -89,7 +93,7 @@ describe("the vendored fixture", () => {
       "token-on-public-get-while-center-is-down",
       "visitor-on-public-get",
     ]);
-    expect(fixture.cases).toHaveLength(31);
+    expect(fixture.cases).toHaveLength(35);
   });
 
   it("holds exactly the gateway cases this suite implements", () => {

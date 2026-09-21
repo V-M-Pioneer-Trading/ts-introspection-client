@@ -88,6 +88,13 @@ export const bearerFrom = (
   if (parts.length !== 2) return null;
   const [scheme, token] = parts as [string, string];
   if (scheme.toLowerCase() !== "bearer") return null;
+  // Belt and braces, and known to be so: the length check is unreachable as
+  // written, because splitting a TRIMMED non-empty string on whitespace runs
+  // cannot produce an empty part, so `parts.length === 2` already guarantees
+  // both are non-empty. `"Bearer "` trims to `"Bearer"` and fails the count
+  // above instead. A mutation that drops it therefore survives the suite, and
+  // that survival is proven equivalence rather than a missing test. It stays
+  // because it is the invariant the NEXT edit to the split would break.
   return token.length > 0 ? token : null;
 };
 

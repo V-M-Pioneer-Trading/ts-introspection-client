@@ -1,10 +1,16 @@
 /**
- * @file The Express 4 adapter, in both shapes the consumers use.
+ * @file The Express 4 adapter, in the two shapes the consumers have.
  *
- * fleet-service mounts one router-level `use` keyed on the request;
- * automation-service decorates routes individually, reads `res.locals.actor`
- * and fences knobs on `kind === "machine"`. Both are exercised here through
- * supertest against a real stub center.
+ * automation-service and st-gateway decorate routes individually, which is the
+ * shape this package now leads with: declarations at registration, bound by
+ * Express's own matcher, behind a `secured()` router that refuses an
+ * undeclared route at startup.
+ *
+ * fleet-service cannot do that — tsoa generates its router, so there is no
+ * call site to put a declaration in — and keeps a router-level `guard()` whose
+ * resolver is a function of the **method alone**. That shape is
+ * path-independent and therefore immune to every matcher bug a path-keyed
+ * table has; `routing.test.ts` is where those bugs are pinned.
  */
 
 import { createServer, type Server } from "node:http";
@@ -20,9 +26,10 @@ import {
   hasScope,
   identityOf,
   kindOf,
+  passthrough,
+  secured,
 } from "../src/express";
 import { MESSAGES } from "../src/messages";
-import type { RouteRequirement } from "../src/types";
 
 const SECRET = "express-suite-secret";
 
@@ -88,55 +95,58 @@ afterAll(async () => {
   await once(center, "close");
 });
 
-const auth = () => createExpressAuth({ url: centerUrl, secret: SECRET });
+export const auth = () => createExpressAuth({ url: centerUrl, secret: SECRET });
 
-/** fleet-service's shape: one router-level `use`, keyed on the request. */
+/**
+ * fleet-service's shape: a generated router behind one `use`-mounted guard
+ * whose resolver reads the method and nothing else.
+ *
+ * Note what is NOT here any more: a `` table[`${req.method} ${req.path}`] ??
+ * "none" `` resolver. `req.path` inside this router is `/cooldown`, not
+ * `/api/fleet/v1/cooldown`, and a miss used to mean "public". Both are gone.
+ */
 const fleetApp = (): Express => {
   const app = express();
-  // The table is the route declaration, and its fallback is `"none"` — which
-  // is what makes an unguarded POST answer 500 instead of running.
-  const table: Record<string, RouteRequirement> = {
-    "POST /ships/navigate": "fleet:control",
-    "GET /cooldown": "session",
-    // Declared for GET, and therefore governing HEAD of the same path too.
-    "GET /ships": "fleet:control",
-  };
-  app.use(
-    auth().guard((req) => table[`${req.method} ${req.path}`] ?? "none")
-  );
-  app.get("/status", (_req, res) => {
-    res.json({ actor: actorOf(res), identity: identityOf(res) });
-  });
-  app.get("/cooldown", (_req, res) => {
-    res.json({ actor: actorOf(res) });
-  });
-  app.get("/ships", (_req, res) => {
-    res.json({ actor: actorOf(res) });
-  });
-  app.post("/ships/navigate", (_req, res) => {
-    res.json({ actor: actorOf(res), kind: kindOf(res) });
-  });
-  // Nobody added this one to the table. That is the whole point.
-  app.post("/ships/jettison", (_req, res) => {
-    res.json({ ranTheHandler: true });
-  });
-  return app;
-};
-
-/** automation-service's shape: per-route guards, an actor, a knob fence. */
-const automationApp = (): Express => {
-  const app = express();
   const a = auth();
+
+  // Public surface, declared out loud, outside the guarded router.
   app.get("/health", a.allowPublic(), (_req, res) => {
     res.json({ actor: actorOf(res) });
   });
-  app.get("/targets", a.requireSession(), (_req, res) => {
-    res.json({ actor: actorOf(res), scopes: identityOf(res)?.scopes });
+
+  const api = express.Router();
+  api.use(
+    a.guard((req) => (req.method === "GET" ? "session" : "fleet:control"))
+  );
+  api.get("/cooldown", (_req, res) => {
+    res.json({ actor: actorOf(res), identity: identityOf(res) });
   });
-  app.post("/targets", a.requireScope("fleet:control"), (_req, res) => {
+  api.post("/ships/navigate", (_req, res) => {
+    res.json({ actor: actorOf(res), kind: kindOf(res) });
+  });
+  // Nobody wrote a declaration for this one, and it does not matter: the
+  // guard covers the whole router by method, so it is a mutation and needs
+  // the scope. That is what a method-only resolver buys.
+  app.use("/api/fleet/v1", api);
+  return app;
+};
+
+/** automation-service's shape: per-route declarations behind `secured()`. */
+const automationApp = (): Express => {
+  const app = express();
+  const a = auth();
+  const api = secured(express.Router());
+
+  api.get("/health", a.allowPublic(), (_req, res) => {
     res.json({ actor: actorOf(res) });
   });
-  app.put("/knobs/alert", a.requireScope("fleet:control"), (_req, res) => {
+  api.get("/targets", a.requireSession(), (_req, res) => {
+    res.json({ actor: actorOf(res), scopes: identityOf(res)?.scopes });
+  });
+  api.post("/targets", a.requireScope("fleet:control"), (_req, res) => {
+    res.json({ actor: actorOf(res) });
+  });
+  api.put("/knobs/alert", a.requireScope("fleet:control"), (_req, res) => {
     // The fence keys on the center's `kind`, never on the subject prefix or on
     // the presence of a header — after decision 21 every caller presents one.
     if (kindOf(res) === "machine") {
@@ -145,64 +155,49 @@ const automationApp = (): Express => {
     }
     res.json({ actor: actorOf(res), refreshes: hasScope(res, "universe:refresh") });
   });
+
+  app.use("/api/automation/v1", api);
   return app;
 };
 
 describe("router-level guard (fleet-service's shape)", () => {
-  it("serves a public GET to a visitor without calling the center", async () => {
-    const response = await request(fleetApp()).get("/status");
+  it("serves the declared-public health route to a visitor", async () => {
+    const response = await request(fleetApp()).get("/health");
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ actor: null, identity: null });
-  });
-
-  it("publishes the identity on a public GET that carries a token", async () => {
-    const response = await request(fleetApp())
-      .get("/status")
-      .set("Authorization", "Bearer operator.token");
-    expect(response.status).toBe(200);
-    expect(response.body.identity).toEqual({
-      sub: "user_operator",
-      kind: "operator",
-      scopes: ["fleet:control", "universe:refresh"],
-    });
+    expect(response.body).toEqual({ actor: null });
   });
 
   it("authorizes a declared mutation and hands the handler the identity", async () => {
     const response = await request(fleetApp())
-      .post("/ships/navigate")
+      .post("/api/fleet/v1/ships/navigate")
       .set("Authorization", "Bearer operator.token");
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ actor: "user_operator", kind: "operator" });
   });
 
-  it("refuses an undeclared mutating route with 500, and never runs it", async () => {
-    const response = await request(fleetApp())
-      .post("/ships/jettison")
-      .set("Authorization", "Bearer operator.token");
-    expect(response.status).toBe(500);
-    expect(response.body).toEqual({
-      error: { message: MESSAGES.undeclaredRoute },
-    });
-    expect(response.body.ranTheHandler).toBeUndefined();
-  });
-
-  it("answers the same 500 with no credential at all", async () => {
-    const response = await request(fleetApp()).post("/ships/jettison");
-    expect(response.status).toBe(500);
-    expect(response.body).toEqual({
-      error: { message: MESSAGES.undeclaredRoute },
-    });
-  });
-
-  it("401s a session route with no header", async () => {
-    const response = await request(fleetApp()).get("/cooldown");
+  it("401s a read route with no header", async () => {
+    const response = await request(fleetApp()).get("/api/fleet/v1/cooldown");
     expect(response.status).toBe(401);
     expect(response.body).toEqual({ error: { message: MESSAGES.missingToken } });
   });
 
-  it("401s a presented token the center rejects, even on a public GET", async () => {
+  it("lets a scopeless session read, and refuses it the mutation", async () => {
+    const read = await request(fleetApp())
+      .get("/api/fleet/v1/cooldown")
+      .set("Authorization", "Bearer guest.token");
+    expect(read.status).toBe(200);
+    expect(read.body.actor).toBe("user_guest");
+
+    const write = await request(fleetApp())
+      .post("/api/fleet/v1/ships/navigate")
+      .set("Authorization", "Bearer guest.token");
+    expect(write.status).toBe(403);
+    expect(write.body).toEqual({ error: { message: MESSAGES.missingScope } });
+  });
+
+  it("401s a presented token the center rejects, even on a public route", async () => {
     const response = await request(fleetApp())
-      .get("/status")
+      .get("/health")
       .set("Authorization", "Bearer expired.token");
     expect(response.status).toBe(401);
     expect(response.body).toEqual({
@@ -211,10 +206,10 @@ describe("router-level guard (fleet-service's shape)", () => {
   });
 });
 
-describe("per-route guards (automation-service's shape)", () => {
+describe("per-route declarations (automation-service's shape)", () => {
   it("lets a scopeless session through a session route", async () => {
     const response = await request(automationApp())
-      .get("/targets")
+      .get("/api/automation/v1/targets")
       .set("Authorization", "Bearer guest.token");
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ actor: "user_guest", scopes: [] });
@@ -222,7 +217,7 @@ describe("per-route guards (automation-service's shape)", () => {
 
   it("403s a session missing the route's scope without naming it", async () => {
     const response = await request(automationApp())
-      .post("/targets")
+      .post("/api/automation/v1/targets")
       .set("Authorization", "Bearer guest.token");
     expect(response.status).toBe(403);
     expect(response.body).toEqual({ error: { message: MESSAGES.missingScope } });
@@ -231,7 +226,7 @@ describe("per-route guards (automation-service's shape)", () => {
 
   it("records the actor for a machine caller", async () => {
     const response = await request(automationApp())
-      .post("/targets")
+      .post("/api/automation/v1/targets")
       .set("Authorization", "Bearer machine.token");
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ actor: "mch_machine" });
@@ -239,19 +234,21 @@ describe("per-route guards (automation-service's shape)", () => {
 
   it("fences a knob on the center's kind, not on the subject prefix", async () => {
     const asMachine = await request(automationApp())
-      .put("/knobs/alert")
+      .put("/api/automation/v1/knobs/alert")
       .set("Authorization", "Bearer disagreeing.token");
     expect(asMachine.status).toBe(403);
 
     const asOperator = await request(automationApp())
-      .put("/knobs/alert")
+      .put("/api/automation/v1/knobs/alert")
       .set("Authorization", "Bearer operator.token");
     expect(asOperator.status).toBe(200);
     expect(asOperator.body).toEqual({ actor: "user_operator", refreshes: true });
   });
 
-  it("serves a public GET to a visitor", async () => {
-    const response = await request(automationApp()).get("/health");
+  it("serves a route declared allowPublic() to a visitor", async () => {
+    const response = await request(automationApp()).get(
+      "/api/automation/v1/health"
+    );
     expect(response.status).toBe(200);
     expect(response.body).toEqual({ actor: null });
   });
@@ -262,7 +259,7 @@ describe("per-route guards (automation-service's shape)", () => {
  * itself, which is what `cors()` does. Written inline rather than adding a
  * dependency — what is under test is mount ORDER, not that package.
  */
-const corsish = (): RequestHandler => (req, res, next) => {
+export const corsish = (): RequestHandler => (req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Authorization");
   if (req.method === "OPTIONS") {
@@ -325,61 +322,51 @@ const runHandler = (
   });
 
 describe("safe methods (meta fixture v2)", () => {
-  it("serves HEAD on a public GET to a visitor", async () => {
-    // Express dispatches HEAD /status to the GET /status handler. Treating
-    // HEAD as mutating answers 500 here and breaks every health probe.
-    const response = await request(fleetApp()).head("/status");
+  it("serves HEAD on a declared-public route to a visitor", async () => {
+    // Express dispatches HEAD /health to the GET /health handler, and the
+    // declaration attached to that route comes with it. Treating HEAD as
+    // mutating answers 500 here and breaks every health probe.
+    const response = await request(fleetApp()).head("/health");
     expect(response.status).toBe(200);
   });
 
-  it("enforces on HEAD what the table declared for GET, via the GET key", async () => {
-    // The table has no "HEAD /cooldown" key. A resolver consulted with the
-    // literal method finds nothing, falls back to "none", and serves a
-    // guarded route's headers to an anonymous caller.
-    const denied = await request(fleetApp()).head("/cooldown");
+  it("resolves a HEAD through the GET the resolver would be asked about", async () => {
+    // A method-only resolver that named GET explicitly must still govern a
+    // HEAD of the same route: `asGet` is what makes the resolver see "GET".
+    const denied = await request(fleetApp()).head("/api/fleet/v1/cooldown");
     expect(denied.status).toBe(401);
 
     const allowed = await request(fleetApp())
-      .head("/cooldown")
+      .head("/api/fleet/v1/cooldown")
       .set("Authorization", "Bearer guest.token");
     expect(allowed.status).toBe(200);
   });
 
-  it("enforces a scope on HEAD, through the same GET key", async () => {
-    const missing = await request(fleetApp())
-      .head("/ships")
-      .set("Authorization", "Bearer guest.token");
-    expect(missing.status).toBe(403);
-
-    const carried = await request(fleetApp())
-      .head("/ships")
-      .set("Authorization", "Bearer operator.token");
-    expect(carried.status).toBe(200);
-  });
-
-  it("401s HEAD on a per-route guard, the same as GET", async () => {
-    // Per-route guards carry a fixed requirement, so there is no table key to
-    // miss — but the exemption must not leak into them either.
-    const response = await request(automationApp()).head("/targets");
+  it("401s HEAD on a per-route declaration, the same as GET", async () => {
+    const response = await request(automationApp()).head(
+      "/api/automation/v1/targets"
+    );
     expect(response.status).toBe(401);
   });
 
-  it("serves HEAD /health declared with allowPublic()", async () => {
-    const response = await request(automationApp()).head("/health");
+  it("serves HEAD on a route declared allowPublic()", async () => {
+    const response = await request(automationApp()).head(
+      "/api/automation/v1/health"
+    );
     expect(response.status).toBe(200);
   });
 
-  it("lets a preflight through when cors is mounted AFTER the guard", async () => {
-    // The guard sees the OPTIONS. It declares "none", so it proceeds as a
-    // visitor rather than answering 500, and cors replies 204.
+  it("lets a preflight through when cors is mounted BEFORE the guard", async () => {
+    // The documented order: the preflight never reaches the guard at all,
+    // which is the only reason preflight works. It does NOT work because the
+    // guard waves OPTIONS through — see routing.test.ts.
     const app = express();
-    app.use(
-      auth().guard((req) => (req.method === "POST" ? "fleet:control" : "none"))
-    );
     app.use(corsish());
-    app.post("/targets", (_req, res) => {
+    const api = secured(express.Router());
+    api.post("/targets", auth().requireScope("fleet:control"), (_req, res) => {
       res.json({ ran: true });
     });
+    app.use(api);
 
     const response = await request(app)
       .options("/targets")
@@ -389,33 +376,64 @@ describe("safe methods (meta fixture v2)", () => {
     expect(response.headers["access-control-allow-origin"]).toBe("*");
   });
 
-  it("lets a preflight through when cors is mounted BEFORE the guard", async () => {
-    // The recommended order: the preflight never reaches the guard at all.
+  it("breaks the preflight when cors is mounted AFTER the router", async () => {
+    // Why the order in the README is an instruction and not a preference.
+    //
+    // Mounted the other way, the preflight never reaches cors at all: an
+    // Express router answers an OPTIONS that matches a path but no method
+    // ITSELF, with a 200 and an `Allow` header, and that is the end of the
+    // request. The answer carries no `Access-Control-Allow-Origin`, so the
+    // browser fails the preflight and the real request is never sent.
+    //
+    // Nothing is authorized away here — no handler ran and no declaration was
+    // skipped — but the cross-origin call is broken, which is the symptom
+    // somebody would come back and "fix" by waving OPTIONS past the guard.
+    // Pinned so that the fix is known to be the mount order instead.
     const app = express();
-    app.use(corsish());
-    app.use(
-      auth().guard((req) => (req.method === "POST" ? "fleet:control" : "none"))
-    );
-    app.post("/targets", (_req, res) => {
+    const api = secured(express.Router());
+    api.post("/targets", auth().requireScope("fleet:control"), (_req, res) => {
       res.json({ ran: true });
     });
+    app.use(api);
+    app.use(corsish());
+
+    const response = await request(app)
+      .options("/targets")
+      .set("Origin", "https://dashboard.example")
+      .set("Access-Control-Request-Method", "POST");
+    expect(response.status).toBe(200);
+    expect(response.headers["allow"]).toContain("POST");
+    expect(response.headers["access-control-allow-origin"]).toBeUndefined();
+  });
+
+  it("answers the preflight with cors headers when cors is mounted FIRST", async () => {
+    // The same app, the one mount swapped. This is the arrangement all three
+    // consumers already have (`app.use(cors())` is their first middleware),
+    // and it is why the preflight keeps working without the guard abdicating.
+    const app = express();
+    app.use(corsish());
+    const api = secured(express.Router());
+    api.post("/targets", auth().requireScope("fleet:control"), (_req, res) => {
+      res.json({ ran: true });
+    });
+    app.use(api);
 
     const response = await request(app)
       .options("/targets")
       .set("Origin", "https://dashboard.example")
       .set("Access-Control-Request-Method", "POST");
     expect(response.status).toBe(204);
+    expect(response.headers["access-control-allow-origin"]).toBe("*");
   });
 
   it("still guards the real request that follows the preflight", async () => {
     const app = express();
     app.use(corsish());
-    app.use(
-      auth().guard((req) => (req.method === "POST" ? "fleet:control" : "none"))
-    );
-    app.post("/targets", (_req, res) => {
+    const api = secured(express.Router());
+    api.post("/targets", auth().requireScope("fleet:control"), (_req, res) => {
       res.json({ ran: true });
     });
+    app.use(api);
 
     const response = await request(app).post("/targets");
     expect(response.status).toBe(401);
@@ -558,27 +576,25 @@ describe("a guard that cannot do its job fails closed", () => {
 describe("the guard trusts req.method and nothing else", () => {
   it("ignores X-HTTP-Method-Override", async () => {
     // S7. No override is honoured here, and none ever will be: if one were, a
-    // POST could present itself as a GET and walk past default-deny. A
+    // POST could present itself as a GET and walk past a mutation's scope. A
     // service that wants overrides mounts that middleware BEFORE the guard,
     // so the guard sees the method the request is actually handled as.
     const app = fleetApp();
 
-    // An undeclared POST stays a POST however it asks to be read.
     const asGet = await request(app)
-      .post("/ships/jettison")
+      .post("/api/fleet/v1/ships/navigate")
       .set("X-HTTP-Method-Override", "GET");
-    expect(asGet.status).toBe(500);
-    expect(asGet.body).toEqual({ error: { message: MESSAGES.undeclaredRoute } });
+    expect(asGet.status).toBe(401);
 
     const asHead = await request(app)
-      .post("/ships/jettison")
+      .post("/api/fleet/v1/ships/navigate")
       .set("X-HTTP-Method-Override", "HEAD");
-    expect(asHead.status).toBe(500);
+    expect(asHead.status).toBe(401);
 
     // And a public GET is not turned into a refused POST by the header
     // either: the override is simply not read.
     const stillAGet = await request(app)
-      .get("/status")
+      .get("/health")
       .set("X-HTTP-Method-Override", "POST");
     expect(stillAGet.status).toBe(200);
   });
@@ -591,14 +607,15 @@ describe("there is one source of truth for the identity", () => {
     // package exists to prevent is a service deriving `kind` for itself.
     // `kindOf(res)` reads `res.locals.identity`, and that is the whole story.
     const app = express();
-    app.use(auth().guard("session"));
-    app.get("/whoami", (_req, res) => {
+    const api = secured(express.Router());
+    api.get("/whoami", auth().requireSession(), (_req, res) => {
       res.json({
         locals: Object.keys(res.locals).sort(),
         kindOf: kindOf(res),
         actorOf: actorOf(res),
       });
     });
+    app.use(api);
 
     const response = await request(app)
       .get("/whoami")
@@ -608,5 +625,31 @@ describe("there is one source of truth for the identity", () => {
     // The center said machine for a `user_` subject, and that is what is read.
     expect(response.body.kindOf).toBe("machine");
     expect(response.body.actorOf).toBe("user_operator");
+  });
+
+  it("records what the route declared, and null when it declared nothing", async () => {
+    const app = express();
+    app.use(auth().guard(() => undefined));
+    app.get("/x", (_req, res) => {
+      res.json({ ran: true });
+    });
+
+    const response = await request(app).get("/x");
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({
+      error: { message: MESSAGES.undeclaredRoute },
+    });
+  });
+});
+
+describe("passthrough()", () => {
+  it("refuses a handler with no reason given", () => {
+    expect(() => passthrough(corsish(), "")).toThrow(/reason/);
+  });
+
+  it("returns the handler unchanged, preserving arity", () => {
+    const handler = corsish();
+    expect(passthrough(handler, "answers preflights")).toBe(handler);
+    expect(handler.length).toBe(3);
   });
 });
