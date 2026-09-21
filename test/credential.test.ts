@@ -4,16 +4,18 @@
  * The fixture pins the *answers* for a malformed `Authorization` header. This
  * file pins the two things it cannot see from outside: that a hostile token is
  * transmitted encoded and arrives byte-identical, and that the header parser
- * never invents a credential out of one that is malformed.
+ * never invents a credential out of one that is malformed — including what two
+ * `Authorization` lines really do on the wire, which is not what this package
+ * used to claim.
  *
  * Every case here is a mutation that would otherwise survive: joining the
  * remainder of a split header, accepting an empty token, picking one of two
- * `Authorization` headers, or writing the token into the body raw.
+ * credentials in a folded header, or writing the token into the body raw.
  */
 
 import { createServer, type Server } from "node:http";
 import { once } from "node:events";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 
 import { createIntrospector } from "../src/center";
 import { bearerFrom, isSafeMethod } from "../src/core";
@@ -172,14 +174,90 @@ describe("bearerFrom never invents a credential", () => {
     expect(bearerFrom("Bearer abc\tdef")).toBeNull();
   });
 
-  it("reads two Authorization headers as no credential", () => {
-    // Node joins repeated headers with ", ", which is what Express hands back
-    // from `req.header("Authorization")`. Picking either one would let a
-    // caller choose which of two credentials a proxy sees verified.
+  it("reads a value carrying two credentials as no credential", () => {
+    // NOT what two Authorization request headers produce — see the wire test
+    // below. This is the shape a proxy that folds a repeated header hands on.
+    // Picking either one would let a caller choose which of two credentials a
+    // service verifies.
     expect(bearerFrom("Bearer abc, Bearer def")).toBeNull();
-    // The array shape a framework may hand back for the same thing.
+    // The array shape a framework may hand back for a repeated header.
     expect(bearerFrom(["Bearer abc", "Bearer def"])).toBeNull();
     expect(bearerFrom(["Bearer abc"])).toBe("abc");
+  });
+});
+
+describe("two Authorization headers, as they really arrive", () => {
+  /**
+   * A previous revision of this file, of `core.ts` and of the README all said
+   * that two `Authorization` lines reach Express joined as `"Bearer a, Bearer
+   * b"` and therefore read as no credential. That is false: `Authorization` is
+   * one of the headers Node's parser treats as single-valued, so a repeat is
+   * DISCARDED and the first line wins. Nothing about the package's behaviour
+   * changes, but the claim was wrong, so it is now tested on the wire with a
+   * raw socket rather than asserted in a comment.
+   */
+  const raw = async (lines: readonly string[]): Promise<Record<string, unknown>> => {
+    const server = createServer((req, res) => {
+      res.setHeader("content-type", "application/json");
+      res.end(
+        JSON.stringify({
+          header: req.headers.authorization ?? null,
+          rawCount: req.rawHeaders.filter(
+            (name, index) =>
+              index % 2 === 0 && name.toLowerCase() === "authorization"
+          ).length,
+        })
+      );
+    });
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const { port } = server.address() as AddressInfo;
+    try {
+      const socket = connect(port, "127.0.0.1");
+      await once(socket, "connect");
+      socket.write(
+        ["GET / HTTP/1.1", "Host: localhost", ...lines, "Connection: close", "", ""].join(
+          "\r\n"
+        )
+      );
+      let body = "";
+      socket.setEncoding("utf8");
+      socket.on("data", (chunk: string) => {
+        body += chunk;
+      });
+      await once(socket, "end");
+      return JSON.parse(body.split("\r\n\r\n")[1] ?? "{}") as Record<
+        string,
+        unknown
+      >;
+    } finally {
+      server.close();
+      await once(server, "close");
+    }
+  };
+
+  it("keeps the first and discards the second — it does not join them", async () => {
+    const seen = await raw([
+      "Authorization: Bearer first.token",
+      "Authorization: Bearer second.token",
+    ]);
+    // Both lines were on the wire...
+    expect(seen.rawCount).toBe(2);
+    // ...and the parsed header is the FIRST one, alone. Not "Bearer
+    // first.token, Bearer second.token".
+    expect(seen.header).toBe("Bearer first.token");
+  });
+
+  it("so the credential a service sees is a well-formed one, and is read", async () => {
+    // The consequence worth stating: a caller sending two headers does not get
+    // "no credential", it gets the first one verified. A service behind a proxy
+    // that folds repeats instead gets the comma value, which reads as none.
+    const seen = await raw([
+      "Authorization: Bearer first.token",
+      "Authorization: Bearer second.token",
+    ]);
+    expect(bearerFrom(seen.header as string)).toBe("first.token");
+    expect(bearerFrom("Bearer first.token, Bearer second.token")).toBeNull();
   });
 });
 

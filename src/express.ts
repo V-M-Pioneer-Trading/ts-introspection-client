@@ -63,6 +63,7 @@
  * This package ignores `X-HTTP-Method-Override` itself and always will.
  */
 
+import { createHash } from "node:crypto";
 import { METHODS } from "node:http";
 
 import type { CenterAnswer, Introspector } from "./center";
@@ -100,6 +101,14 @@ export interface ResponseLike {
   locals: Record<string, unknown>;
   status(code: number): ResponseLike;
   json(body: unknown): unknown;
+  /**
+   * The status as it stands. Optional so a minimal test double is still
+   * assignable; a real `Response` has it, and {@link notFound} reads it to
+   * refuse to let a terminal answer a success.
+   */
+  readonly statusCode?: number;
+  /** Whether the head has already gone out, for the same reason. */
+  readonly headersSent?: boolean;
 }
 
 /** Express's `next`. An error argument makes Express fail the request. */
@@ -115,33 +124,71 @@ export type HandlerLike = (
 /*
  * Where this package's own per-request state lives.
  *
- * Module-private Symbols rather than string keys: `res.locals` is the host
- * application's namespace, and a string key is both a collision risk and an
- * accessor nobody declared — a service that reads `res.locals.identity`
- * directly is depending on a name, which is exactly the coupling
- * `identityOf()` exists to prevent. A Symbol cannot be read by name, does not
- * appear in `Object.keys(res.locals)`, and is not serialised by
- * `JSON.stringify(res.locals)`.
+ * NOT on `res.locals`, under any key. `res.locals` is the host application's
+ * namespace and it is *printed*: `util.inspect(res.locals)`, a debugger, an
+ * error reporter that serialises context, or a `console.log` in a handler all
+ * walk it — and `util.inspect` shows Symbol-keyed properties too, so a Symbol
+ * key hides a value from `Object.keys` and from `JSON.stringify` but not from
+ * the place a raw `Authorization` header actually leaks from. An earlier
+ * revision memoized the center's answer there *together with the raw header
+ * value it was about*, which put a live credential one `console.log(res.locals)`
+ * away from a log aggregator.
+ *
+ * So: one module-private WeakMap keyed on the response object. It is invisible
+ * to every form of inspection of `res` (there is no property to find), it dies
+ * with the response, and it cannot be read without a reference to this
+ * module's own binding. One mechanism for all three pieces of state rather
+ * than two — the identity carries no secret, but a second mechanism is a
+ * second thing to reason about.
+ *
+ * The memo does not hold the header value either: it holds a SHA-256 digest of
+ * it, which is all that is needed to answer "is this the same credential the
+ * first enforcement point asked about?".
  */
-const IDENTITY = Symbol("introspection.identity");
-const REQUIRES = Symbol("introspection.requires");
-const INTROSPECTION = Symbol("introspection.memo");
+interface RequestState {
+  /** The center's verdict for this request, once something has enforced. */
+  identity?: Identity | null;
+  /** What the matched route declared, or null when it declared nothing. */
+  requires?: RouteRequirement | null;
+  /** One request's memoized center answer, and a digest of the header it was about. */
+  memo?: { readonly digest: string; readonly answer: Promise<CenterAnswer> };
+}
 
-/** `res.locals`, viewed through this package's private keys. */
-const privateLocals = (res: ResponseLike): Record<symbol, unknown> =>
-  res.locals as unknown as Record<symbol, unknown>;
+const requestState = new WeakMap<object, RequestState>();
+
+const stateOf = (res: ResponseLike): RequestState => {
+  let state = requestState.get(res);
+  if (state === undefined) {
+    state = {};
+    requestState.set(res, state);
+  }
+  return state;
+};
+
+/**
+ * A digest of one `Authorization` header value, never the value.
+ *
+ * SHA-256 and not a truncation or a length: the memo key must distinguish two
+ * different credentials with certainty, and must not be reversible into the
+ * one it stands for if it is ever printed.
+ */
+const digestOf = (authorization: string | null): string =>
+  authorization === null
+    ? "absent"
+    : createHash("sha256").update(authorization, "utf8").digest("hex");
 
 /**
  * The verified identity for this request, or null when the caller is a
  * visitor. This and {@link kindOf} / {@link actorOf} / {@link hasScope} are
- * the **only** supported accessors: the value is stored under a module-private
- * Symbol, so there is no key to read instead.
+ * the **only** supported accessors: the value is held in a module-private
+ * WeakMap keyed on the response, so there is no key on `res.locals` to read
+ * instead and nothing of ours appears in an inspection of it.
  *
  * There is deliberately no second copy of `kind` or of the subject. One source
  * of truth — the center's answer — and these four read it.
  */
 export const identityOf = (res: ResponseLike): Identity | null =>
-  (privateLocals(res)[IDENTITY] as Identity | null | undefined) ?? null;
+  requestState.get(res)?.identity ?? null;
 
 /**
  * The subject, or null for a visitor. This is the accessor for
@@ -164,7 +211,7 @@ export const hasScope = (res: ResponseLike, scope: string): boolean =>
 
 /** What the route this request matched declared, or null if it declared nothing. */
 export const requirementOf = (res: ResponseLike): RouteRequirement | null =>
-  (privateLocals(res)[REQUIRES] as RouteRequirement | null | undefined) ?? null;
+  requestState.get(res)?.requires ?? null;
 
 /**
  * Maps one request to what its route declares, from the **method alone**.
@@ -228,8 +275,15 @@ const isBranded = (set: WeakSet<object>, value: unknown): boolean =>
   typeof value === "function" && set.has(value);
 
 /**
- * Vouch for a handler that is **not a route**: a body parser, a CORS
- * middleware, a logger — anything that will call `next()` rather than answer.
+ * Vouch for a handler that **never serves a resource**: a body parser, a CORS
+ * middleware, a logger — anything that will call `next()` rather than answer a
+ * request for something.
+ *
+ * "Never serves a resource" rather than "never responds": a `cors()` that
+ * terminates a preflight is a passthrough, because a preflight asks for
+ * permission rather than for a resource, and an OPTIONS answered with headers
+ * discloses nothing a route would have protected. Anything that can answer a
+ * request *for something* is a route and declares like one.
  *
  * From the outside a middleware and a route are the same shape and only the
  * author knows which one will answer, so this is the explicit way to say
@@ -240,8 +294,15 @@ const isBranded = (set: WeakSet<object>, value: unknown): boolean =>
  * api.use(passthrough(express.json(), "parses bodies; never answers"));
  * ```
  *
- * The handler is returned unchanged, so arity — which is how Express tells an
- * error handler from an ordinary one — is preserved exactly.
+ * "Never answers" is the whole claim: a `cors()` that terminates a preflight
+ * is still a passthrough, because a preflight is not a resource. Anything that
+ * can serve one is a route and declares.
+ *
+ * What comes back is a **wrapper**, branded in this package's place of the
+ * caller's function: branding the argument would leave the caller holding a
+ * vouched-for function it could then register anywhere, undeclared. The
+ * wrapper delegates with the same `this` and arguments and reports the same
+ * `length`, which is how Express tells an error handler from an ordinary one.
  */
 export function passthrough<H>(handler: H, why: string): H {
   if (typeof handler !== "function") {
@@ -252,9 +313,31 @@ export function passthrough<H>(handler: H, why: string): H {
       "passthrough() requires a reason: say why this handler is not a route that needs a declaration"
     );
   }
-  passthroughs.add(handler);
-  return handler;
+  const wrapper = delegating(handler as unknown as (...a: unknown[]) => unknown);
+  passthroughs.add(wrapper);
+  return wrapper as unknown as H;
 }
+
+/**
+ * A function that calls `fn` and reports `fn`'s arity.
+ *
+ * `Function.prototype.length` is `configurable: true`, so it can be redefined;
+ * Express reads it at dispatch time to decide whether a layer is an error
+ * handler, and a wrapper that reported 3 where the original said 4 would turn
+ * an error handler into one that runs on ordinary requests.
+ */
+const delegating = (
+  fn: (...args: unknown[]) => unknown
+): ((...args: unknown[]) => unknown) => {
+  const wrapper = function (this: unknown, ...args: unknown[]): unknown {
+    return fn.apply(this, args);
+  };
+  Object.defineProperty(wrapper, "length", {
+    value: fn.length,
+    configurable: true,
+  });
+  return wrapper;
+};
 
 /**
  * The terminal "nothing matched" handler, which needs no credential because
@@ -264,11 +347,22 @@ export function passthrough<H>(handler: H, why: string): H {
  * app.use(notFound((_req, res) => res.status(404).json({ error: { message: "not found" } })));
  * ```
  *
- * It is accepted only as the **last** thing registered on a secured target:
- * once one is mounted, the only further registration allowed is an error
- * handler (arity 4), which is what Express itself requires anyway. A
- * `notFound()` mounted early would shadow every route after it — an outage,
- * not a hole, but a loud one either way.
+ * It is accepted in **exactly one position**: `use(notFound(handler))` — no
+ * path argument, the only handler of that call, never on `get`/`post`/`all`
+ * or a `route()` chain, and last, so that only an error handler (arity 4) may
+ * follow. Every other position is a general catch-all wearing a 404's clothes:
+ * `app.use("/admin", notFound(h))` would serve `h` to anyone for every method
+ * under `/admin`, with nothing declared and no call to the center. That was a
+ * real hole here, and the position rule is half of closing it.
+ *
+ * The other half is that what comes back is a **wrapper that cannot answer a
+ * success**. It sets `404` before calling the handler, refuses any attempt to
+ * set a status below `400` while it runs, and forces `404` again afterwards if
+ * the status somehow came back under `400` and the head has not gone out. A
+ * "not found" that can be made to return `200` is just an undeclared route.
+ *
+ * The brand goes on the wrapper, never on the caller's function: branding the
+ * argument would hand the caller a vouched-for function to register anywhere.
  *
  * It is not an authorization decision and does not ask the center: a 404 that
  * introspected first would tell an unauthenticated caller the difference
@@ -279,8 +373,52 @@ export function notFound<H>(handler: H): H {
   if (typeof handler !== "function") {
     throw new TypeError("notFound() takes a handler function");
   }
-  terminals.add(handler);
-  return handler;
+  const inner = handler as unknown as HandlerLike;
+
+  const wrapper: HandlerLike = (req, res, next) => {
+    const setStatus = res.status.bind(res) as (code: number) => ResponseLike;
+    const mutable = res as unknown as Record<string, unknown>;
+    const hadOwnStatus = Object.prototype.hasOwnProperty.call(res, "status");
+    const ownStatus = mutable["status"];
+    let restored = false;
+    const restore = (): void => {
+      if (restored) return;
+      restored = true;
+      if (hadOwnStatus) mutable["status"] = ownStatus;
+      else delete mutable["status"];
+    };
+
+    setStatus(404);
+    // While the terminal runs, `res.status(200)` is a defect rather than an
+    // instruction. Clamped rather than thrown: the caller gets its 404 and the
+    // request still ends, which is the safe reading of a handler that has
+    // already been told it is answering "not found".
+    mutable["status"] = (code: unknown): ResponseLike =>
+      setStatus(typeof code === "number" && code >= 400 ? code : 404);
+
+    try {
+      inner(req, res, (err?: unknown) => {
+        // Handing control on: the response is no longer ours to clamp, and an
+        // error handler must be able to answer 500.
+        restore();
+        next(err);
+      });
+    } finally {
+      if (!restored) {
+        const current = res.statusCode;
+        if (
+          typeof current === "number" &&
+          current < 400 &&
+          res.headersSent !== true
+        ) {
+          setStatus(404);
+        }
+      }
+    }
+  };
+
+  terminals.add(wrapper);
+  return wrapper as unknown as H;
 }
 
 // ---------------------------------------------------------------------------
@@ -448,12 +586,30 @@ const assertUseSafe = (args: readonly unknown[], name: string): void => {
   }
 
   const terminalIndex = handlers.findIndex((h) => isBranded(terminals, h));
-  if (terminalIndex >= 0 && terminalIndex !== handlers.length - 1) {
-    throw new Error(
-      `${where} mounts a notFound() handler with handlers after it.\n\n` +
-        "A terminal not-found handler answers everything that reaches it, so\n" +
-        "anything registered behind it is unreachable. It goes last."
-    );
+  if (terminalIndex >= 0) {
+    if (terminalIndex !== handlers.length - 1) {
+      throw new Error(
+        `${where} mounts a notFound() handler with handlers after it.\n\n` +
+          "A terminal not-found handler answers everything that reaches it, so\n" +
+          "anything registered behind it is unreachable. It goes last."
+      );
+    }
+    // The only accepted spelling. A path argument, or another handler in the
+    // same call, turns the terminal into a catch-all for everything under that
+    // path: it answers every method, declares nothing and never asks the
+    // center, which is an authorization bypass wearing a 404's clothes.
+    if (isPathArgument(args[0]) || handlers.length !== 1) {
+      throw new Error(
+        `${where} mounts a notFound() handler on a path or alongside other handlers.\n\n` +
+          "A notFound() terminal is accepted in exactly one position:\n\n" +
+          "    app.use(notFound(handler));\n\n" +
+          "with no path argument and no other handler in the call. Mounted on a\n" +
+          "path it is a catch-all that answers every method under that path with\n" +
+          "no declaration and no call to the center. If that mount is meant to\n" +
+          "serve something, it is a route and declares like one:\n\n" +
+          '    app.use("/admin", auth.requireScope("…"), handler);'
+      );
+    }
   }
 
   if (declared === 1) {
@@ -689,15 +845,9 @@ const apply = (res: ResponseLike, decision: Decision, next: NextLike): void => {
     sendRejection(res, decision.status, decision.message);
     return;
   }
-  privateLocals(res)[IDENTITY] = decision.identity;
+  stateOf(res).identity = decision.identity;
   next();
 };
-
-/** One request's memoized center answer, and the header it was asked about. */
-interface Memo {
-  readonly authorization: string | null;
-  readonly answer: Promise<CenterAnswer>;
-}
 
 export function createExpressAuth(
   source: IntrospectionConfig | Introspector | Authorizer
@@ -708,16 +858,18 @@ export function createExpressAuth(
    * the stricter effectively wins. What must NOT happen twice is the HTTP
    * call: one inbound request is one question for the center.
    *
-   * The answer is memoized on `res.locals` under a module-private Symbol, so
-   * it lives exactly as long as the response does and cannot be shared
-   * between requests — a process-wide cache keyed on the header would be a
-   * second verification path with a different answer, would make revocation
-   * meaningless for its lifetime, and would hand one caller's identity to
-   * another the moment two callers presented the same header value.
+   * The answer is memoized in a module-private WeakMap keyed on the RESPONSE
+   * object, so it lives exactly as long as the response does and cannot be
+   * shared between requests — a process-wide cache keyed on the header would
+   * be a second verification path with a different answer, would make
+   * revocation meaningless for its lifetime, and would hand one caller's
+   * identity to another the moment two callers presented the same header
+   * value.
    *
-   * It is keyed on the exact `Authorization` header value as well, so a
-   * second enforcement point reading a header the first did not see asks
-   * again rather than reusing an answer about a different credential.
+   * It is keyed on a SHA-256 DIGEST of the `Authorization` header as well, so
+   * a second enforcement point reading a header the first did not see asks
+   * again rather than reusing an answer about a different credential — and so
+   * that the memo never holds the credential itself.
    */
   let injected: Authorizer | null = null;
   let introspector: Introspector | null = null;
@@ -732,15 +884,14 @@ export function createExpressAuth(
     // A host that injected a whole Authorizer keeps its own transport, and
     // there is no introspector here to memoize around.
     if (injected !== null) return injected;
-    const locals = privateLocals(res);
+    const state = stateOf(res);
+    const digest = digestOf(authorization);
     return createAuthorizer({
       introspect: (token) => {
-        const memo = locals[INTROSPECTION] as Memo | undefined;
-        if (memo !== undefined && memo.authorization === authorization) {
-          return memo.answer;
-        }
+        const memo = state.memo;
+        if (memo !== undefined && memo.digest === digest) return memo.answer;
         const answer = introspector!.introspect(token);
-        locals[INTROSPECTION] = { authorization, answer } satisfies Memo;
+        state.memo = { digest, answer };
         return answer;
       },
     });
@@ -764,14 +915,15 @@ export function createExpressAuth(
         // `"none"` would make a miss indistinguishable from a route that
         // declared itself public; `"session"` would serve the route to anyone
         // holding any token at all. Neither is a thing to guess.
-        privateLocals(res)[REQUIRES] = null;
+        stateOf(res).requires = null;
         sendRejection(res, 500, MESSAGES.undeclaredRoute);
         return;
       }
-      privateLocals(res)[REQUIRES] = requires;
+      stateOf(res).requires = requires;
 
-      // A repeated header arrives joined; `bearerFrom` reads that as no
-      // credential rather than picking one of the two.
+      // Node discards a repeated `Authorization` line and keeps the first, so
+      // what arrives here is one value; a comma-folded one carrying two
+      // credentials is read by `bearerFrom` as no credential at all.
       const authorization = headerValue(req, "Authorization");
 
       authorizerFor(res, authorization)

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+.readme-check/
 *.tgz
 *.log
 .DS_Store

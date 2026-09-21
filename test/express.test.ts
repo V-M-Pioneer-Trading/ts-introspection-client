@@ -650,9 +650,32 @@ describe("passthrough()", () => {
     expect(() => passthrough(corsish(), "")).toThrow(/reason/);
   });
 
-  it("returns the handler unchanged, preserving arity", () => {
+  it("returns a delegating WRAPPER, preserving arity, and brands only that", () => {
+    // The brand must not land on the caller's own function: a caller holding a
+    // vouched-for function could register it anywhere, undeclared.
     const handler = corsish();
-    expect(passthrough(handler, "answers preflights")).toBe(handler);
-    expect(handler.length).toBe(3);
+    const wrapped = passthrough(handler, "answers preflights");
+    expect(wrapped).not.toBe(handler);
+    // Arity is how Express tells an error handler from an ordinary one.
+    expect(wrapped.length).toBe(handler.length);
+    expect(wrapped.length).toBe(3);
+
+    const api = secured(express.Router());
+    expect(() => api.use(wrapped)).not.toThrow();
+    expect(() => api.use(handler as never)).toThrow(/neither a declaration nor/);
+  });
+
+  it("preserves the arity of an error handler it is given", () => {
+    const onError = (_e: unknown, _req: any, _res: any, _n: any): void => {};
+    expect(passthrough(onError, "logs errors; never answers").length).toBe(4);
+  });
+
+  it("delegates the call, with the same arguments", () => {
+    const seen: unknown[] = [];
+    const inner = (a: unknown, b: unknown, c: unknown): void => {
+      seen.push(a, b, c);
+    };
+    passthrough(inner, "records")(1 as never, 2 as never, 3 as never);
+    expect(seen).toEqual([1, 2, 3]);
   });
 });

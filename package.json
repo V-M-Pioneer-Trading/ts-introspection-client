@@ -23,6 +23,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "jest",
+    "check:readme": "node scripts/check-readme.mjs",
     "prepack": "npm run build"
   },
   "devDependencies": {

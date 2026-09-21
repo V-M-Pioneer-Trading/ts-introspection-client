@@ -71,13 +71,20 @@ export interface InboundRequest {
  * - `"Bearer abc def"` is not the token `abcdef`. A header is never
  *   concatenated into a token — joining the remainder invents a credential
  *   nobody issued and sends it to the center.
- * - Two `Authorization` headers, which Express joins into
- *   `"Bearer a, Bearer b"`, are four parts and read as no credential. Picking
- *   one of them would let a caller choose which of two credentials a proxy
- *   sees a service verify.
+ * - `"Bearer a, Bearer b"` — a value that already carries two credentials,
+ *   folded into one line by a proxy — is four parts and reads as no
+ *   credential. Picking one of them would let a caller choose which of two
+ *   credentials a service verifies.
  *
- * An array (the shape a framework may hand back for a repeated header) is
- * joined the way Node joins one, and then fails the same count check.
+ * **Two `Authorization` request headers do not produce that value.** Node's
+ * parser does not join repeats of `Authorization`: it is on the list of
+ * single-value headers it discards duplicates of, so `req.headers.authorization`
+ * — and therefore `req.header("Authorization")` — is the **first** line and the
+ * second is dropped before any of this runs. Verified on the wire in
+ * `credential.test.ts` rather than assumed. The joined shape is still handled
+ * here because a proxy or a framework may fold one, and an array (the shape a
+ * framework may hand back for a repeated header) is joined the way Node joins
+ * a repeatable header and then fails the same count check.
  */
 export const bearerFrom = (
   header: string | readonly string[] | null | undefined

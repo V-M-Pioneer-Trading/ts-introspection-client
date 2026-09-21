@@ -102,11 +102,18 @@ for `OPTIONS`.
 **P6. One inbound request asks the center at most once.** A router-level
 `guard()` and a route's own declaration both enforce — the stricter effectively
 wins, because each compares the same answer against its own requirement — but
-the answer is memoized for the life of the response, under a module-private
-Symbol on `res.locals`, keyed on the exact `Authorization` header value. It is
-never shared between requests: a process-wide cache would be a second
-verification path, would make revocation meaningless for its lifetime, and
-would hand one caller's identity to the next caller presenting the same header.
+the answer is memoized for the life of the response, in a module-private
+`WeakMap` keyed on the response object, under a **SHA-256 digest** of the
+`Authorization` header. Nothing of ours is a property of `res` or of
+`res.locals`, so none of it reaches `util.inspect(res.locals)`, a
+`console.log`, a debugger or an error reporter — an earlier revision kept the
+memo on `res.locals` together with the raw header it was about, which put a
+live credential one `console.log` from a log aggregator. The digest is what
+makes a second enforcement point reading a *different* header ask again rather
+than reuse an answer about another credential. It is never shared between
+requests: a process-wide cache would be a second verification path, would make
+revocation meaningless for its lifetime, and would hand one caller's identity
+to the next caller presenting the same header.
 
 ### What this package does **not** protect
 
@@ -129,7 +136,23 @@ A fence whose gaps are unknown is worse than no fence.
   have this property, because Express dispatches to it and the declaration
   runs.
 - **What a `passthrough()` actually does.** It is the author's word that a
-  handler is middleware and will never answer. That is why it takes a reason.
+  handler is middleware and **never serves a resource**. Terminating a CORS
+  preflight is not serving a resource, so `cors()` is a passthrough; anything
+  that can answer a request *for something* is a route and declares. That is
+  why it takes a reason. The brand goes on the wrapper `passthrough()` returns,
+  never on the function passed in, so nothing the caller still holds is
+  vouched for.
+- **What a `notFound()` actually does, beyond its status.** What it *cannot* do
+  is protect something: the wrapper sets `404` before the handler runs, clamps
+  any attempt to set a status below `400` while it runs, and forces `404` back
+  if the status is under `400` when it returns — so a terminal that tried to
+  answer `200` answers `404` instead. It is accepted in exactly one position,
+  `app.use(notFound(handler))`: no path argument, no other handler in the call,
+  never on `get`/`post`/`all`/`route()`, and last. `app.use("/admin",
+  notFound(handler))` — a catch-all serving every method under a prefix with no
+  declaration and no call to the center — is refused at startup. What is left
+  unprotected is the handler's own content: it may still read the request and
+  put anything it likes in a `404` body.
 - **A second copy of this package in one process.** `secured()` would not
   recognise the other copy's declarations — a refusal to start, not a hole.
 - **Anything after the guard runs.** A knob fence, a tenant check, an ownership
@@ -145,18 +168,25 @@ Every construct the three services contain, in the spelling this package
 accepts.
 
 ```ts
+import type { ErrorRequestHandler } from "express";
+
 const app = secured(express());
 
 // 1. Health routes: public is declared out loud, and a bare `app.get` is not.
 app.get("/health", auth.allowPublic(), health);
 app.get("/api/fleet/health", auth.allowPublic(), health);
 
-// 2. A generated router (tsoa) has no call site for a declaration, so it gets
-//    a router-level guard. The resolver is a function of the METHOD alone.
-const api = express.Router();
-api.use(auth.guard(({ method }) => (method === "GET" ? "session" : "fleet:control")));
-RegisterRoutes(api);
-app.use("/api/fleet/v1", api);
+// 2. A generated router (tsoa) has no call site for a declaration, so the
+//    guard goes on the MOUNT, ahead of it. The resolver is a function of the
+//    METHOD alone. See the note below: this is the one shape that is checked
+//    at runtime rather than at startup.
+const generatedRouter = express.Router();
+RegisterRoutes(generatedRouter);
+app.use(
+  "/api/fleet/v1",
+  auth.guard(({ method }) => (method === "GET" ? "session" : "fleet:control")),
+  generatedRouter
+);
 
 // 3. A DECLARED MOUNT: the leading declaration covers everything after it, so
 //    third-party middleware that cannot be branded needs no wrapper.
@@ -174,8 +204,46 @@ app.use(notFound((_req, res) => res.status(404).json({ error: { message: "not fo
 
 // 6. Error handlers (arity 4) are accepted as they are: Express invokes such a
 //    layer only with an error already in hand, so it can never serve a route.
-app.use((err, _req, res, _next) => res.status(500).json({ error: { message: "internal" } }));
+//    Annotate it — Express's own `use()` overloads infer the 3-argument shape,
+//    so an inline 4-argument arrow is an implicit-any under `strict`.
+const onError: ErrorRequestHandler = (_err, _req, res, _next) => {
+  res.status(500).json({ error: { message: "internal" } });
+};
+app.use(onError);
 ```
+
+**A generated router is the one construct startup checking cannot see inside.**
+`RegisterRoutes()` registers onto a plain `express.Router()`, which is not
+`secured()` — it cannot be, because the routes it adds carry no declarations
+and every one of them would be refused. The guard on the mount is what protects
+them, and it protects them **at runtime**: every request Express routes into
+that router passes the guard first, so an undeclared route inside it is still
+answered only if the guard's resolver allowed the method. What is lost is the
+boot-time failure — a route added inside the generated router that needs a
+different requirement from its method's is not detected at startup, because
+there is nothing to detect it at. CI registers exactly this shape against the
+packed tarball and makes real requests through it (anonymous `GET` → `401`,
+credentialed `GET` → `200`, a `POST` on a session without the scope → `403`,
+an unmatched path → the app's own `404`), because a typecheck cannot see any
+of that. Do not `secured()` the generated router, and do not put the guard
+inside it and then mount it bare: an arity-3 router mounted with no declaration
+ahead of it is refused, which is the boot failure that found this.
+
+### A gap the migration cannot close: the shared-secret callers
+
+automation-service's `knobWriteGuard` picks its requirement from the
+`X-Service-Secret` header, and `POST /events` uses `requireServiceSecret()`;
+this package has no shared-secret primitive and will not get one, because
+[decision 21][d21] says a machine caller presents a Clerk M2M token like every
+other caller and is fenced on what the center says about it. So this is a
+**behaviour change the consumer has to plan**, not a spelling to translate: the
+callers of those routes must be issued M2M tokens and start sending
+`Authorization: Bearer …` before the routes are migrated, and the routes then
+declare an ordinary scope and add `kindOf(res) === "machine"` inside the
+handler where the secret check used to be. Until both halves have shipped,
+leave those two routes on their existing guard and migrate the rest around
+them — a route that swaps a shared secret for a scope before its callers hold
+tokens is a `401` for every caller, not a tightening.
 
 st-gateway is the one consumer that does **not** secure its app: `/proxy`
 forwards anonymous mutations by design (`POST /register` carries the caller's
@@ -185,12 +253,26 @@ package has no spelling for "a mutating route that needs no credential" —
 `createLaneDeriver` only; the declared mount above is what it would write if it
 ever authorized.
 
+**Pass `timeoutMs: 250` to the gateway's lane deriver.** The default is 1000 ms
+(the fixture's `clientTimeoutMs`), which is the right budget for a decision
+that *rejects* — there, waiting is better than a wrong answer. The lane is not
+that: it never rejects, and a center that does not answer in time yields
+`background`, which is the same lane an anonymous caller gets. So the whole
+cost of a slow center is paid on the latency of every credentialed proxied
+request, in exchange for an answer the gateway is willing to guess anyway.
+250 ms is comfortably above a healthy center's round trip on the same network
+and low enough that a hanging one costs a quarter of a second rather than a
+full one before the request proceeds.
+
 ### Reading the identity
 
 `identityOf(res)`, `actorOf(res)`, `kindOf(res)`, `hasScope(res, scope)` and
-`requirementOf(res)` are the **only** accessors. The values live under
-module-private Symbols, so there is no `res.locals` key to read instead — and
-none of it appears in `Object.keys(res.locals)` or a `JSON.stringify` of it.
+`requirementOf(res)` are the **only** accessors. The values live in a
+module-private `WeakMap` keyed on the response, so there is no `res.locals` key
+to read instead — the identity, the requirement and the memo are all in the one
+place, and none of them appears in `Object.keys(res.locals)`, in a
+`JSON.stringify` of it, or in `util.inspect(res.locals, { showHidden: true })`,
+which *does* print Symbol-keyed properties.
 There is deliberately no second copy of `kind`: a knob fence is
 `kindOf(res) === "machine"`, never a look at the `sub` prefix.
 
@@ -202,8 +284,8 @@ There is deliberately no second copy of `kind`: a knob fence is
 |---|---|
 | `createExpressAuth(config \| introspector \| authorizer)` | `requireScope(scope)`, `requireSession()`, `allowPublic()`, `guard(requirement \| resolver)` |
 | `secured(routerOrAppOrRoute)` | Patches in place; enforces the registration rules. Idempotent |
-| `passthrough(handler, why)` | Brands middleware that never answers |
-| `notFound(handler)` | Brands the terminal 404; only an error handler may follow it |
+| `passthrough(handler, why)` | Returns a branded wrapper around middleware that never serves a resource |
+| `notFound(handler)` | Returns a branded wrapper that forces a 404; accepted only as `use(notFound(h))`, last |
 | `identityOf` / `actorOf` / `kindOf` / `hasScope` / `requirementOf` | The accessors |
 | `createAuthorizer(config \| introspector)` | The framework-agnostic policy: `authorize({ method, requires, authorization })` |
 | `createLaneDeriver(config \| introspector)` | st-gateway's lane policy |
@@ -270,8 +352,9 @@ const lane = await deriver.derive(req.header("Authorization")); // "interactive"
 **credentialed** request the gateway proxies; anonymous requests are unaffected,
 since nothing to introspect keeps the center off the hot path of the public map.
 `timeoutMs` defaults to 1000 ms (the fixture's `clientTimeoutMs`), a proxy may
-reasonably pass less, and a test bounds the elapsed time against a stub that
-never answers.
+reasonably pass less — **250 ms is the recommendation for st-gateway**, for the
+reason given in the migration section — and a test bounds the elapsed time
+against a stub that never answers.
 
 ### Security notes
 
@@ -290,8 +373,14 @@ never answers.
   does not become a fleet-wide `401` storm, and the body is read under a 64 KiB
   cap.
 - **A malformed `Authorization` header is never repaired.** `"Bearer"`,
-  `"Bearer "`, `"Bearer abc def"` and two `Authorization` headers (Express joins
-  them into `"Bearer a, Bearer b"`) all read as *no credential*.
+  `"Bearer "`, `"Bearer abc def"` and a value carrying two credentials
+  (`"Bearer a, Bearer b"`, as a proxy that folds a repeated header produces)
+  all read as *no credential*. Two `Authorization` **request headers** do not
+  produce that value and never did: `Authorization` is single-valued to Node's
+  parser, which discards the repeat, so `req.header("Authorization")` is the
+  **first** line and that one credential is verified normally. An earlier
+  revision of this file claimed the opposite; the behaviour is unchanged and
+  the real wire behaviour is now pinned by a raw-socket test.
 - **A guard that cannot do its job fails closed.** An injected introspector that
   rejects or throws calls `next(error)` — never bare `next()`, which would run
   the handler the guard just failed to authorize.
@@ -299,14 +388,29 @@ never answers.
 ## Development
 
 ```sh
-npm ci && npm run typecheck && npm run build && npm test
+npm ci && npm run typecheck && npm run build && npm test && npm run check:readme
 ```
+
+`check:readme` extracts **every** fenced `ts`/`js` snippet on this page,
+compiles it against `src/` and then **runs** it. Running is the half that
+matters: `secured()` enforces at registration time, so a snippet that boots is
+a snippet a consumer can copy — and the fourth review found this file
+instructing fleet-service to write a construct that throws at startup. Two
+transforms and no others: the package's own name becomes a relative import of
+`src/`, and a snippet's leading `import` lines are hoisted out of the wrapper
+its body goes into. Free identifiers (`auth`, `RegisterRoutes`, `swaggerUi`, …)
+come from `scripts/readme-prelude.ts`, where `RegisterRoutes` really registers
+routes and `swaggerUi.serve` really is an array — a stub that was merely typed
+would prove nothing about what `secured()` does with it.
 
 CI additionally packs the tarball, installs it into a scratch project and
 typechecks two probes with `skipLibCheck: false` — one without
 `@types/express` (the core claim), one with a real Express app (the adapter
-claim) — then proves the registration rules against the **packed** tarball at
-runtime, because a typecheck cannot see them.
+claim) — then proves two things against the **packed** tarball at runtime,
+because a typecheck cannot see either: the registration rules (including that
+a `notFound()` is refused on a path or alongside another handler), and the
+generated-router mount answering live requests as the migration section
+promises.
 
 **Re-vendoring the fixture.** `meta` owns it and this repository holds a copy so
 drift shows in a diff, so change `meta` first; the exact commands and the

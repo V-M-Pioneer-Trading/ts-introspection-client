@@ -1,7 +1,7 @@
 introspection.json is vendored verbatim. It is not maintained here.
 
   original    V-M-Pioneer-Trading/meta, path fixtures/introspection.json
-  meta commit ea0301664cc369064f7a41af41ce0691c47e25df
+  meta commit 53b2cd8cc1007c62d22a3abe7970bf7e16d8814f
   blob        e1399314dee4aec96e93c7a004a7126c4a2e5a6f
   vendored    2026-09-21
   version     2
@@ -9,18 +9,14 @@ introspection.json is vendored verbatim. It is not maintained here.
   bytes       46238
   sha256      e605f62b820129068acbaef5d67af9b49df9fcf2247d0319ec4f9196338ea3a8
 
-THE COMMIT ABOVE IS AN UNMERGED PULL-REQUEST HEAD, not a commit on meta's
-main: V-M-Pioneer-Trading/meta#84, the branch `feat/fixture-safe-methods`,
-and it is that branch's **second** head — the first review of this package
-produced four more fixture cases, so the record moved from `45b13eb` to
-`ea03016` and the sha256 moved with it. It is recorded as a PR head
-deliberately — this package implements the safe-method rule and cannot
-honestly point at a commit that predates it — but it is a temporary state.
-**When meta#84 merges, re-point this record at the squash commit on main.**
-The bytes do not change when it does: main's squash commit carries the same
-blob, so `blob`, `bytes` and `sha256` above stay exactly as they are and only
-the `meta commit` line moves. If that re-point ever changes the sha256, the
-two are not the same fixture and something was edited during the merge.
+The commit above is a commit on meta's **main**: the squash of
+V-M-Pioneer-Trading/meta#84 ("Exempt the safe methods from default-deny
+(meta#80 step 4)"). This record used to point at that PR's unmerged head,
+`ea03016`, because the package implements the safe-method rule and could not
+honestly point at a commit predating it; the re-point was made when #84
+merged. It carried the same blob across the squash, exactly as predicted, so
+`blob`, `bytes` and `sha256` are unchanged and only the commit line moved —
+which is the check that the merge edited nothing.
 
 The sha256 is over the LF bytes of the blob as git stores it, which is what
 `git show <commit>:fixtures/introspection.json` prints. test/conformance.test.ts

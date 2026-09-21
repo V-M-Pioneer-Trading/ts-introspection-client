@@ -40,6 +40,14 @@ jobs:
 
       - run: npm test
 
+      # Every fenced ts/js snippet in README.md is extracted, compiled and RUN.
+      # The README is the migration instructions for three services, and a
+      # snippet that `secured()` refuses at registration is a defect of the
+      # same size as a broken export — which is exactly what the fourth review
+      # found in the generated-router section. Compiling is not enough to catch
+      # that, because the refusal happens when the snippet runs.
+      - run: npm run check:readme
+
       # The tarball a consumer installs is built here too, so a `files` list
       # that forgot dist/ fails before a tag is ever pushed.
       - name: Pack and check the tarball's contents
@@ -209,14 +217,18 @@ jobs:
           });
           app.use("/api/automation/v1", api);
 
-          // The generated-router shape: a resolver keyed on the METHOD, which
-          // is all it is given. `undefined` means undeclared, and there is
-          // deliberately no `?? "none"` to write.
+          // The generated-router shape: the guard leads the MOUNT, because a
+          // router tsoa generated onto cannot be secured() and cannot be
+          // mounted bare. Its resolver is keyed on the METHOD, which is all it
+          // is given; `undefined` means undeclared, and there is deliberately
+          // no `?? "none"` to write. The runtime step below registers this
+          // same shape and makes real requests through it.
           const generated = express.Router();
-          generated.use(
-            auth.guard(({ method }) => (method === "GET" ? "session" : "fleet:control"))
+          app.use(
+            "/api/fleet/v1",
+            auth.guard(({ method }) => (method === "GET" ? "session" : "fleet:control")),
+            generated
           );
-          app.use("/api/fleet/v1", generated);
 
           // The declared-mount constructs the three consumers actually have:
           // a third-party middleware list and a body parser behind one
@@ -280,5 +292,115 @@ jobs:
             app.use((err, _req, res, _next) => res.status(500).json({ error: { message: String(err) } }));
             refuses('a route after notFound()', () => app.get('/late', auth.allowPublic(), handler));
 
-            console.log('secured() enforces position, arity and the reserved words');
+            refuses('a notFound() on a path', () =>
+              secured(express()).use('/admin', notFound(handler)));
+            refuses('a notFound() alongside another handler', () =>
+              secured(express()).use(notFound(handler), handler));
+            refuses('a bare express.Router(), which is a function of arity 3', () =>
+              secured(express()).use('/api/fleet/v1', express.Router()));
+
+            console.log('secured() enforces position, arity, the reserved words and the terminal');
           "
+
+      # The claims a typecheck REALLY cannot see: what the generated-router
+      # mount does to live requests, and that the terminal cannot be made to
+      # answer a success. fleet-service's whole surface is a tsoa-generated
+      # router, so this shape is the one the README tells it to write and the
+      # one the fourth review found documented wrong. Registered for real and
+      # driven over HTTP, from the packed tarball.
+      - name: Prove the generated-router mount enforces at runtime, from the tarball
+        run: |
+          cd /tmp/consumer
+          npm install --no-save express@4 > /dev/null
+          cat > runtime-generated.js <<'JS'
+          const http = require('node:http');
+          const express = require('express');
+          const {
+            createExpressAuth,
+            notFound,
+            secured,
+          } = require('@v-m-pioneer-trading/introspection-client');
+
+          // A stand-in auth-service. `session.token` is an active session with
+          // NO scopes, which is what separates a 200 from a 403 below.
+          const TOKENS = {
+            'session.token': {
+              active: true, sub: 'user_guest', kind: 'operator', scope: '', exp: 4102444800,
+            },
+            'operator.token': {
+              active: true, sub: 'user_operator', kind: 'operator',
+              scope: 'fleet:control', exp: 4102444800,
+            },
+          };
+          let centerCalls = 0;
+          const center = http.createServer((req, res) => {
+            const chunks = [];
+            req.on('data', (c) => chunks.push(c));
+            req.on('end', () => {
+              centerCalls += 1;
+              const token = new URLSearchParams(Buffer.concat(chunks).toString()).get('token');
+              res.writeHead(200, { 'Content-Type': 'application/json' });
+              res.end(JSON.stringify(TOKENS[token] ?? { active: false }));
+            });
+          });
+
+          const fail = (message) => { console.error('::error::' + message); process.exitCode = 1; };
+          const is = (what, actual, expected) => {
+            if (actual !== expected) fail(what + ': expected ' + expected + ', got ' + actual);
+            else console.log('  ok  ' + what + ' -> ' + actual);
+          };
+
+          center.listen(0, '127.0.0.1', async () => {
+            const auth = createExpressAuth({
+              url: 'http://127.0.0.1:' + center.address().port + '/auth/v1/introspect',
+              secret: 'runtime-proof-secret',
+            });
+
+            // tsoa's output: a PLAIN router carrying undeclared routes. It
+            // cannot be secured() — every route it holds would be refused —
+            // and it cannot be mounted bare. The guard leads the mount.
+            const generated = express.Router();
+            generated.get('/ships', (_req, res) => res.json({ ships: [] }));
+            generated.post('/ships/:id/navigate', (_req, res) => res.json({ navigating: true }));
+
+            const app = secured(express());
+            app.use(
+              '/api/fleet/v1',
+              auth.guard(({ method }) => (method === 'GET' ? 'session' : 'fleet:control')),
+              generated
+            );
+            app.use(notFound((_req, res) => {
+              // Tries to answer 200. The wrapper must not let it.
+              res.status(200).json({ error: { message: 'not found' } });
+            }));
+
+            const server = app.listen(0, '127.0.0.1');
+            await new Promise((resolve) => server.once('listening', resolve));
+            const base = 'http://127.0.0.1:' + server.address().port;
+            const call = async (method, path, token) => {
+              const response = await fetch(base + path, {
+                method,
+                headers: token ? { Authorization: 'Bearer ' + token } : {},
+              });
+              return response.status;
+            };
+
+            is('anonymous GET into the generated router', await call('GET', '/api/fleet/v1/ships'), 401);
+            is('credentialed GET', await call('GET', '/api/fleet/v1/ships', 'session.token'), 200);
+            is('POST on a session without the scope', await call('POST', '/api/fleet/v1/ships/1/navigate', 'session.token'), 403);
+            is('POST on a session carrying it', await call('POST', '/api/fleet/v1/ships/1/navigate', 'operator.token'), 200);
+            is('an inactive token', await call('GET', '/api/fleet/v1/ships', 'revoked.token'), 401);
+
+            const before = centerCalls;
+            is('an unmatched path', await call('GET', '/nope'), 404);
+            is('anonymous POST at the terminal', await call('POST', '/admin/delete-everything'), 404);
+            if (centerCalls !== before) fail('the terminal asked the center ' + (centerCalls - before) + ' time(s)');
+            else console.log('  ok  the terminal never asks the center');
+
+            server.close();
+            center.close();
+            if (process.exitCode) console.error('::error::the tarball does not enforce the documented shape');
+            else console.log('the generated-router mount enforces at runtime, from the tarball');
+          });
+          JS
+          node runtime-generated.js
