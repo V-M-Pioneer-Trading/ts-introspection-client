@@ -70,4 +70,50 @@ describe("loadIntrospectionConfig", () => {
       })
     ).toThrow(/no query string/);
   });
+
+  describe("the runtime it needs", () => {
+    // S5. `engines.node >= 18` is advice a package manager may print and then
+    // install anyway, and a host can delete or shim `globalThis.fetch`.
+    // Without this check the first symptom is a 503 on every credentialed
+    // request — which reads as an auth outage and is really a runtime the
+    // service never had. Startup is the honest place to say so.
+    const withoutFetch = async (run: () => void): Promise<void> => {
+      const original = globalThis.fetch;
+      // @ts-expect-error deliberately removing a global the package requires
+      delete globalThis.fetch;
+      try {
+        run();
+      } finally {
+        globalThis.fetch = original;
+      }
+    };
+
+    it("refuses to start when global fetch is missing", async () => {
+      await withoutFetch(() => {
+        expect(() => loadIntrospectionConfig(good)).toThrow(
+          IntrospectionConfigError
+        );
+        expect(() => loadIntrospectionConfig(good)).toThrow(
+          /global fetch is not available/
+        );
+        // The message names the remedy, not a stack frame.
+        expect(() => loadIntrospectionConfig(good)).toThrow(/Node 18 or newer/);
+      });
+    });
+
+    it("says nothing about fetch when it is there", () => {
+      expect(() => loadIntrospectionConfig(good)).not.toThrow();
+    });
+
+    it("never renders the secret in that message either", async () => {
+      await withoutFetch(() => {
+        try {
+          loadIntrospectionConfig(good);
+          throw new Error("expected a throw");
+        } catch (error) {
+          expect(String(error)).not.toContain(good[ENV_SECRET]);
+        }
+      });
+    });
+  });
 });

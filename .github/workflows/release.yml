@@ -21,9 +21,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to a full commit SHA, not a tag: a tag
+      # is a movable pointer in someone else's repository, and this is the one
+      # job in the repository that holds `contents: write`. The comment
+      # records which release the SHA was, so a bump is a visible diff.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -57,8 +61,14 @@ jobs:
       - name: Publish the release with the tarball attached
         env:
           GH_TOKEN: ${{ github.token }}
+          # Through the environment, never interpolated into the script body:
+          # a `${{ }}` expression is pasted into the shell before it runs, so a
+          # value carrying a quote or a `$(` would be executed rather than
+          # read. This particular value is a filename we produced ourselves —
+          # the point is that the shape is safe wherever it is copied next.
+          TARBALL: ${{ steps.pack.outputs.file }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "${{ steps.pack.outputs.file }}" \
+          gh release create "$GITHUB_REF_NAME" "$TARBALL" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --generate-notes

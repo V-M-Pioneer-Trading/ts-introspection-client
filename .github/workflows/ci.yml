@@ -18,9 +18,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to a full commit SHA, not a tag: a tag
+      # is a movable pointer in someone else's repository, and `@v4` silently
+      # becomes whatever they push to it. The comment records which release
+      # the SHA was, so a reviewer can read the intent and a bump is a visible
+      # diff.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: npm
@@ -55,39 +60,58 @@ jobs:
             exit 1
           fi
 
+      # Two probes, because the package makes two different claims.
+      #
+      # 1. The CORE claim: a consumer that does not use Express at all can
+      #    typecheck this package with `skipLibCheck: false` and WITHOUT
+      #    `@types/express` installed. `skipLibCheck: true` (the old setting
+      #    here) suppresses exactly the error that would catch a `.d.ts`
+      #    referencing a package the consumer has not got, so the probe was
+      #    passing without testing anything. The adapter's types are declared
+      #    locally in src/express.ts for this reason.
+      #
+      # 2. The ADAPTER claim: a consumer that DOES use Express can hand a real
+      #    `app.use(...)` the handler this package returns, and read
+      #    `res.locals` back through the accessors, with no cast.
       - name: Install the tarball into a scratch CommonJS project
         run: |
           tarball=$(readlink -f ./*.tgz)
           mkdir -p /tmp/consumer && cd /tmp/consumer
           npm init -y > /dev/null
           npm install "$tarball" > /dev/null
-          # require() works, and the types resolve under moduleResolution: node.
+          # require() works, and every export is really there.
           node -e "
             const c = require('@v-m-pioneer-trading/introspection-client');
-            for (const name of ['createAuthorizer','createExpressAuth','createLaneDeriver','loadIntrospectionConfig','MESSAGES']) {
+            for (const name of ['createAuthorizer','createExpressAuth','createLaneDeriver','loadIntrospectionConfig','isSafeMethod','MESSAGES']) {
               if (typeof c[name] === 'undefined') throw new Error('missing export ' + name);
             }
             console.log('require() ok');
           "
           npm install --no-save typescript@5 @types/node@22 > /dev/null
-          cat > tsconfig.json <<'JSON'
+          # The installed tree must not have pulled Express in as a peer.
+          if [ -d node_modules/@types/express ]; then
+            echo "::error::@types/express is installed; the core probe would not prove anything"
+            exit 1
+          fi
+          cat > tsconfig.core.json <<'JSON'
           {
             "compilerOptions": {
               "target": "ES2022",
               "module": "commonjs",
               "moduleResolution": "node",
               "strict": true,
-              "skipLibCheck": true,
+              "skipLibCheck": false,
               "noEmit": true,
               "types": ["node"]
             },
-            "include": ["probe.ts"]
+            "include": ["probe-core.ts"]
           }
           JSON
-          cat > probe.ts <<'TS'
+          cat > probe-core.ts <<'TS'
           import {
             createAuthorizer,
             createLaneDeriver,
+            isSafeMethod,
             type Decision,
             type Identity,
             type Lane,
@@ -97,15 +121,82 @@ jobs:
           const authorizer = createAuthorizer(config);
           const deriver = createLaneDeriver(config);
 
-          export async function probe(): Promise<[Decision, Lane, Identity | null]> {
+          export async function probe(): Promise<[Decision, Lane, Identity | null, boolean]> {
             const decision = await authorizer.authorize({
               method: "POST",
               requires: "fleet:control",
               authorization: "Bearer opaque",
             });
             const lane = await deriver.derive("Bearer opaque");
-            return [decision, lane, decision.outcome === "proceed" ? decision.identity : null];
+            return [
+              decision,
+              lane,
+              decision.outcome === "proceed" ? decision.identity : null,
+              isSafeMethod("HEAD"),
+            ];
           }
           TS
-          npx tsc -p tsconfig.json
-          echo "types resolve under moduleResolution: node"
+          npx tsc -p tsconfig.core.json
+          echo "core types resolve with skipLibCheck: false and no @types/express"
+
+      - name: Typecheck the adapter against a real Express consumer
+        run: |
+          cd /tmp/consumer
+          # typescript and @types/node are re-listed because the previous step
+          # installed them with --no-save, and npm prunes anything not in
+          # package.json on the next install.
+          npm install --no-save typescript@5 @types/node@22 express@4 @types/express@4 > /dev/null
+          cat > tsconfig.express.json <<'JSON'
+          {
+            "compilerOptions": {
+              "target": "ES2022",
+              "module": "commonjs",
+              "moduleResolution": "node",
+              "esModuleInterop": true,
+              "strict": true,
+              "skipLibCheck": true,
+              "noEmit": true,
+              "types": ["node"]
+            },
+            "include": ["probe-express.ts"]
+          }
+          JSON
+          cat > probe-express.ts <<'TS'
+          import express from "express";
+          import {
+            actorOf,
+            createExpressAuth,
+            hasScope,
+            identityOf,
+            kindOf,
+            type RouteRequirement,
+          } from "@v-m-pioneer-trading/introspection-client";
+
+          const auth = createExpressAuth({
+            url: "http://localhost:3005/auth/v1/introspect",
+            secret: "x",
+          });
+
+          const table: Record<string, RouteRequirement> = {
+            "POST /ships/navigate": "fleet:control",
+            "GET /cooldown": "session",
+          };
+
+          export const app = express();
+          // No cast anywhere: the locally declared handler type has to be
+          // structurally acceptable to a real Express app.
+          app.use(auth.guard((req) => table[`${req.method} ${req.path}`] ?? "none"));
+          app.get("/health", auth.allowPublic(), (_req, res) => {
+            res.json({ actor: actorOf(res) });
+          });
+          app.post("/targets", auth.requireScope("fleet:control"), (_req, res) => {
+            res.json({
+              actor: actorOf(res),
+              kind: kindOf(res),
+              identity: identityOf(res),
+              refreshes: hasScope(res, "universe:refresh"),
+            });
+          });
+          TS
+          npx tsc -p tsconfig.express.json
+          echo "the adapter typechecks against a real Express app with no cast"

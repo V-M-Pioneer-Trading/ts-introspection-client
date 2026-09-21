@@ -3,7 +3,7 @@
  *
  * Three entry points, deliberately separate:
  *
- * - {@link createAuthorizer} — the framework-agnostic policy, the twenty-four
+ * - {@link createAuthorizer} — the framework-agnostic policy, the thirty-one
  *   calling-service cases of `meta/fixtures/introspection.json`.
  * - {@link createExpressAuth} — the Express 4 adapter over it.
  * - {@link createLaneDeriver} — st-gateway's lane policy, which never rejects
@@ -23,7 +23,7 @@ export type { CenterAnswer, Introspector } from "./center";
 export { createIntrospector, splitScopes } from "./center";
 
 export type { Authorizer, InboundRequest } from "./core";
-export { bearerFrom, createAuthorizer } from "./core";
+export { bearerFrom, createAuthorizer, isSafeMethod } from "./core";
 
 export type { LaneDeriver } from "./gateway";
 export { createLaneDeriver } from "./gateway";
@@ -39,7 +39,14 @@ export {
   SECRET_HEADER,
 } from "./messages";
 
-export type { ExpressAuth, RequirementResolver } from "./express";
+export type {
+  ExpressAuth,
+  HandlerLike,
+  NextLike,
+  RequestLike,
+  RequirementResolver,
+  ResponseLike,
+} from "./express";
 export {
   actorOf,
   createExpressAuth,
@@ -48,6 +55,5 @@ export {
   kindOf,
   LOCALS_ACTOR,
   LOCALS_IDENTITY,
-  LOCALS_KIND,
   LOCALS_REQUIRES,
 } from "./express";

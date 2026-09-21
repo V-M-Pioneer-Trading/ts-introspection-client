@@ -26,9 +26,10 @@ export interface Identity {
 /**
  * What a route declares it needs.
  *
- * - `"none"` — no credential declared. On a `GET` that means a public route
- *   an anonymous visitor may read; on any other method it is a defect and the
- *   route answers 500 before the `Authorization` header is read.
+ * - `"none"` — no credential declared. On a **safe** method (`GET`, `HEAD` or
+ *   `OPTIONS`, RFC 9110 §9.2.1) that means a public route an anonymous visitor
+ *   may read, or a CORS preflight; on any **mutating** method it is a defect
+ *   and the route answers 500 before the `Authorization` header is read.
  * - `"session"` — any verified session, carrying any scopes at all, including
  *   none.
  * - anything else — a scope literal such as `"fleet:control"` that the

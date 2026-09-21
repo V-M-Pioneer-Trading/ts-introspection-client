@@ -1,11 +1,23 @@
 introspection.json is vendored verbatim. It is not maintained here.
 
   original    V-M-Pioneer-Trading/meta, path fixtures/introspection.json
-  meta commit 476f02f1d789a633cabfce46395320e24472545d
-  blob        c7fda96d190407944a5cd26cc439dab31dd627e2
+  meta commit 45b13ebdd0f2f3680539e9f47514d8db4669d943
+  blob        b9456ed6c0be1a15ba7df6fbb2999578d3aad828
   vendored    2026-09-21
-  bytes       32581
-  sha256      e937ad88062c0f6259d4aed67fb13e3fc75502c3c1f342d0b5cbbb59801a6fe0
+  version     2
+  bytes       39520
+  sha256      d64baac540906202d6ad633d0d5f23273510109499c4c5b556d18b8bd486c837
+
+THE COMMIT ABOVE IS AN UNMERGED PULL-REQUEST HEAD, not a commit on meta's
+main: V-M-Pioneer-Trading/meta#84, the branch `feat/fixture-safe-methods`.
+It is recorded that way deliberately — this package implements the
+safe-method rule and cannot honestly point at a commit that predates it —
+but it is a temporary state. **When meta#84 merges, re-point this record at
+the squash commit on main.** The bytes do not change when it does: main's
+squash commit carries the same blob, so `blob`, `bytes` and `sha256` above
+stay exactly as they are and only the `meta commit` line moves. If that
+re-point ever changes the sha256, the two are not the same fixture and
+something was edited during the merge.
 
 The sha256 is over the LF bytes of the blob as git stores it, which is what
 `git show <commit>:fixtures/introspection.json` prints. test/conformance.test.ts
@@ -17,8 +29,8 @@ To re-vendor after meta changes the fixture:
   git -C ../meta show HEAD:fixtures/introspection.json > test/fixtures/introspection.json
   node -e "const c=require('crypto'),f=require('fs');const b=f.readFileSync('test/fixtures/introspection.json');console.log(b.length,c.createHash('sha256').update(b).digest('hex'))"
 
-then update the commit, date, bytes and sha256 above. Change meta first; a copy
-that leads the original is drift pointing the other way.
+then update the commit, date, version, bytes and sha256 above. Change meta
+first; a copy that leads the original is drift pointing the other way.
 
 The conformance suite also asserts the sorted list of case names, so a case
 added upstream fails here until it is implemented rather than being skipped.

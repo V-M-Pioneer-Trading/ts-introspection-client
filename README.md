@@ -10,13 +10,20 @@ what the token carries and compares the answer against what their own route
 declares. This package is that client for the three Node services
 (fleet-service, automation-service, st-gateway), and its behaviour is not
 described here but *fixed* by [`fixtures/introspection.json`][fixture] in the
-`meta` repository — twenty-four conditions for a calling service and nine more
+`meta` repository — thirty-one conditions for a calling service and ten more
 for st-gateway's queue lane, each with the center's response and the exact
 status, message, identity and call count expected. That file is vendored into
-`test/fixtures/` and the conformance suite drives all thirty-three of its cases
+`test/fixtures/` and the conformance suite drives all forty-one of its cases
 against a real local HTTP stub.
 
-Zero runtime dependencies. CommonJS plus `.d.ts`. Node >= 18.
+Zero runtime dependencies, and **no peer dependencies at all** — not even
+Express. The adapter's types are declared locally (see
+[Method handling](#method-handling)), so a consumer that never touches Express
+typechecks this package with `skipLibCheck: false` and nothing installed.
+CommonJS plus `.d.ts`. Node >= 18, asserted at startup rather than hoped for:
+`loadIntrospectionConfig()` refuses to start if `globalThis.fetch` is missing,
+because the alternative is a `503` on every credentialed request that reads as
+an auth outage.
 
 ## Install
 
@@ -76,12 +83,20 @@ app.get("/targets", auth.requireSession(), handler);
 app.post("/targets", auth.requireScope("fleet:control"), handler);
 ```
 
-The identity is published on `res.locals` — `res.locals.identity`,
-`res.locals.actor`, `res.locals.kind` — with `identityOf(res)`, `actorOf(res)`,
-`kindOf(res)` and `hasScope(res, scope)` as typed readers. A knob-class fence
-is `kindOf(res) === "machine"`, never a look at the subject prefix and never a
-check for the presence of a header, because after decision 21 every caller
-presents one.
+The identity is published on `res.locals.identity`, and the subject is
+duplicated to `res.locals.actor` because automation-service's existing
+`detail.actor` recording reads that key by name. **`identityOf(res)`,
+`actorOf(res)`, `kindOf(res)` and `hasScope(res, scope)` are the supported
+accessors** — read `res.locals` directly and you are relying on key names this
+package may change.
+
+**There is deliberately no `res.locals.kind`.** It existed and was removed: a
+second copy of the center's answer is a second thing to keep true, and the one
+failure this package exists to prevent is a service deriving `kind` for
+itself. `kindOf(res)` reads `res.locals.identity`, and that is the whole story.
+A knob-class fence is `kindOf(res) === "machine"`, never a look at the subject
+prefix and never a check for the presence of a header, because after decision
+21 every caller presents one.
 
 **Per-route guards alone cannot give default-deny** — a route with no guard has
 nothing to run — so a service using them must *also* mount `auth.guard()`
@@ -125,8 +140,9 @@ Rows are in evaluation order, and the first is first for a reason.
 
 | Situation | Answer | Center called |
 |---|---|---|
-| Non-`GET` route declaring `"none"` | `500` `this route declares no required scope` | **no** |
-| No `Authorization`, `GET` declaring `"none"` | proceeds as a visitor, identity `null` | **no** |
+| **Mutating** route declaring `"none"` | `500` `this route declares no required scope` | **no** |
+| A resolver that throws, on any method | `500` `this route declares no required scope` | **no** |
+| No `Authorization`, **safe** method declaring `"none"` | proceeds as a visitor, identity `null` | **no** |
 | `Authorization` that is not `Bearer <something>` | `401` `a bearer token is required` | **no** |
 | No `Authorization`, route declaring a session or a scope | `401` `a bearer token is required` | **no** |
 | `{"active": false}` | `401` `invalid or expired session`, on **every** method | yes |
@@ -140,6 +156,56 @@ on whitespace **runs** with empties discarded, matching `strings.Fields`,
 `/\s+/` and `\s+` in the other implementations. `kind` is the center's answer,
 used verbatim and never re-derived from the `sub` prefix — that convention now
 lives in exactly one place.
+
+## Method handling
+
+**Default-deny applies to mutating methods only.** `GET`, `HEAD` and `OPTIONS`
+are the safe methods of RFC 9110 §9.2.1 and are exempt from it (owner's
+delegate, 2026-09-21; `meta` fixture `version: 2`). Method names are compared
+**case-insensitively**; scope literals are compared **exactly** — not by
+prefix, not by namespace walk, not case-folded, so `fleet:control:read` and
+`FLEET:CONTROL` both fail a route requiring `fleet:control`.
+
+- **`HEAD` is the same route as `GET`.** Express dispatches `HEAD /x` to the
+  `GET /x` handler, so the adapter calls your resolver with `req.method`
+  reading `"GET"` for a `HEAD`. A table keyed `"GET /cooldown"` therefore
+  governs `HEAD /cooldown` as well, with no second entry. Without that, a
+  `HEAD` would miss the table, fall back to `"none"` and serve a guarded
+  route's headers — which leak existence, sizes and `ETag`s — to an anonymous
+  caller. Exemption from *default-deny* is not exemption from a requirement
+  the route *declared*: `HEAD` with no credential on a guarded route is the
+  same `401` as `GET`.
+- **`OPTIONS` with no declared requirement proceeds as a visitor.** A CORS
+  preflight carries no `Authorization` header by definition.
+- **The real `req.method` is never mutated.** Only the object handed to the
+  resolver reads `"GET"`; your handlers, and the policy itself, still see the
+  `HEAD`.
+
+### Mounting cors
+
+Either order works and both are tested, but **mount `cors()` before the
+guard**:
+
+```ts
+app.use(cors());          // answers the preflight itself, 204
+app.use(auth.guard(...)); // never sees it
+```
+
+Mounted the other way the preflight reaches the guard first. That is fine —
+`OPTIONS` is safe, so it proceeds as a visitor and `cors()` answers — but it
+spends a middleware hop on every preflight and depends on the route resolving
+to `"none"` for `OPTIONS`. If a resolver ever returns a scope for an `OPTIONS`,
+the preflight gets a `401` the browser reports as a CORS failure.
+
+### Method override
+
+**The guard trusts `req.method` and reads no override header.**
+`X-HTTP-Method-Override` is ignored, and a test pins that it is: if it were
+honoured, a `POST` could present itself as a `GET` and walk straight past
+default-deny. If a service does use a method-override middleware, **mount it
+before the guard**, so that by the time the guard runs `req.method` is the
+method the request will actually be handled as. Mounted after, default-deny is
+decided about one method and the route runs as another.
 
 ## Security notes
 
@@ -164,6 +230,41 @@ lives in exactly one place.
 - **A partial or wrongly typed answer is `503`, not `active: false`.** A
   half-deployed center must not become a fleet-wide `401` storm.
 - **The response body is read under a 64 KiB cap** and abandoned past it.
+- **A malformed `Authorization` header is never repaired.** `"Bearer"`,
+  `"Bearer "`, `"Bearer abc def"` and two `Authorization` headers (which
+  Express joins into `"Bearer a, Bearer b"`) all read as *no credential*: the
+  header must be exactly the scheme plus one token. Joining the remainder
+  would invent a credential nobody issued and send it to the center.
+- **The token is URL-encoded into the form body**, so `&`, `=`, `+`, `%` and
+  CR/LF arrive byte-identical and cannot inject a field or a header.
+- **A guard that cannot do its job fails closed.** An injected introspector
+  that rejects or throws calls `next(error)` — never bare `next()`, which
+  would run the handler the guard just failed to authorize — and a resolver
+  that throws answers `500` on **every** method. A resolver that throws has
+  told us nothing about the route, and neither `"none"` nor `"session"` is a
+  thing to guess in its place.
+
+### Gateway latency, and the `timeoutMs` knob
+
+**`createLaneDeriver` awaits the center.** A *hanging* center therefore adds up
+to `timeoutMs` to every **credentialed** request st-gateway proxies — the lane
+is still `background` and the request still goes through, but it goes through
+late. **Anonymous requests are unaffected**: no credential means nothing to
+introspect, so the center is never on the hot path of the public map, and
+neither is a `Basic` header or a `"Bearer "` with no token.
+
+`timeoutMs` is configurable on every entry point, including the lane deriver,
+and **defaults to 1000 ms** (the fixture's `clientTimeoutMs`). st-gateway may
+pass something shorter — it is a proxy, and how much latency an auth outage is
+allowed to add to its own hot path is its decision, not this package's:
+
+```ts
+const deriver = createLaneDeriver({ ...config, timeoutMs: 250 });
+```
+
+A test bounds the elapsed time against a stub that accepts the connection and
+never answers, so an unbounded wait is a red test rather than a production
+stall.
 
 ## Development
 
@@ -184,8 +285,18 @@ git -C ../meta show HEAD:fixtures/introspection.json > test/fixtures/introspecti
 node -e "const c=require('crypto'),f=require('fs');const b=f.readFileSync('test/fixtures/introspection.json');console.log(b.length,c.createHash('sha256').update(b).digest('hex'))"
 ```
 
-Then update the commit, date, byte count and sha256 in
-[`test/fixtures/SOURCE`](test/fixtures/SOURCE). The suite recomputes the hash
+Then update the commit, date, version, byte count and sha256 in
+[`test/fixtures/SOURCE`](test/fixtures/SOURCE).
+
+> **The vendored copy currently points at an unmerged pull-request head**
+> ([meta#84](https://github.com/V-M-Pioneer-Trading/meta/pull/84), the
+> `feat/fixture-safe-methods` branch), because this package implements the
+> safe-method rule and cannot honestly point at a commit that predates it.
+> When that PR merges, re-point `SOURCE` at the squash commit on `main`. The
+> bytes do not change: only the `meta commit` line moves, and the sha256 must
+> come out identical.
+
+The suite recomputes the hash
 on every run, asserts the sorted list of case names, and **fails on an unknown
 assertion key** — so a case added upstream is a red test rather than a case
 quietly skipped. `.gitattributes` marks the copy `-text` so no checkout ever

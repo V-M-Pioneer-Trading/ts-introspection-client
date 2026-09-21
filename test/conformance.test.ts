@@ -1,5 +1,5 @@
 /**
- * @file All thirty-three conditions of meta's introspection fixture.
+ * @file All forty-one conditions of meta's introspection fixture.
  *
  * Driven against a real local HTTP stub, one per case, so that what the client
  * sends is asserted on the wire and not against a mock of itself. Nothing here
@@ -51,7 +51,7 @@ describe("the vendored fixture", () => {
     // Belt and braces: if both the copy and SOURCE were edited together, this
     // literal still pins the bytes the implementation was reviewed against.
     expect(fixtureSha256()).toBe(
-      "e937ad88062c0f6259d4aed67fb13e3fc75502c3c1f342d0b5cbbb59801a6fe0"
+      "d64baac540906202d6ad633d0d5f23273510109499c4c5b556d18b8bd486c837"
     );
   });
 
@@ -61,12 +61,18 @@ describe("the vendored fixture", () => {
       "active-with-irregular-scope-whitespace",
       "active-with-multi-value-scope",
       "active-with-required-scope",
+      "active-with-scope-differing-only-in-case",
+      "active-with-scope-that-is-a-prefix-of-required",
       "active-without-required-scope",
+      "bearer-with-empty-token",
+      "bearer-with-internal-whitespace",
       "center-rejects-our-caller-secret",
       "center-returns-500",
       "center-returns-malformed-json",
       "center-times-out",
       "center-unreachable",
+      "head-on-guarded-route-with-no-header",
+      "head-on-public-get",
       "inactive-token-on-guarded-route",
       "inactive-token-on-public-get",
       "kind-disagrees-with-sub-prefix",
@@ -76,19 +82,21 @@ describe("the vendored fixture", () => {
       "no-header-on-guarded-route",
       "non-bearer-scheme-on-guarded-route",
       "operator-on-public-get",
+      "options-with-no-declared-scope",
       "session-route-with-inactive-token",
       "session-route-with-no-header",
       "session-route-with-scopeless-token",
       "token-on-public-get-while-center-is-down",
       "visitor-on-public-get",
     ]);
-    expect(fixture.cases).toHaveLength(24);
+    expect(fixture.cases).toHaveLength(31);
   });
 
   it("holds exactly the gateway cases this suite implements", () => {
     expect(fixture.gatewayCases.map((c) => c.name).sort()).toEqual([
       "gateway-active-machine",
       "gateway-active-operator",
+      "gateway-bearer-with-empty-token",
       "gateway-center-rejects-our-caller-secret",
       "gateway-center-unreachable",
       "gateway-inactive-token",
@@ -97,7 +105,14 @@ describe("the vendored fixture", () => {
       "gateway-no-header",
       "gateway-non-bearer-scheme",
     ]);
-    expect(fixture.gatewayCases).toHaveLength(9);
+    expect(fixture.gatewayCases).toHaveLength(10);
+  });
+
+  it("is fixture version 2, the one that exempts the safe methods", () => {
+    // Version 1 declared default-deny on every non-GET method. A copy that
+    // fell back to it would silently stop asserting the HEAD and OPTIONS
+    // cases, which is the drift this number exists to make visible.
+    expect(fixture.version).toBe(2);
   });
 
   it("pins the names the implementation hard-codes", () => {

@@ -61,6 +61,17 @@ export function loadIntrospectionConfig(
     );
   }
 
+  if (typeof globalThis.fetch !== "function") {
+    // `engines.node >= 18` is a promise the package manager may warn about and
+    // then install anyway, and a host can delete or shim `globalThis.fetch`.
+    // Without this the failure surfaces as a 503 on the first credentialed
+    // request — an auth outage that is really a runtime the service never had.
+    // Startup is the honest place for it.
+    throw new IntrospectionConfigError(
+      "global fetch is not available — this package needs Node 18 or newer (engines.node >= 18)"
+    );
+  }
+
   if (parsed.search.length > 0) {
     // A token never goes in a query string, and neither does anything else:
     // an endpoint URL carrying a query is a sign the secret was put there.
