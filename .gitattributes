@@ -1,0 +1,7 @@
+* text=auto eol=lf
+
+# The vendored fixture is compared byte for byte against a sha256 recorded in
+# test/fixtures/SOURCE. Any line-ending translation would break that check on
+# a Windows checkout, so the bytes are never touched.
+test/fixtures/introspection.json -text
+test/fixtures/SOURCE -text
