@@ -1,0 +1,188 @@
+/**
+ * @file The policy, with no framework anywhere near it.
+ *
+ * This is the thirty-five calling-service cases of
+ * `meta/fixtures/introspection.json` and nothing else. The Express adapter is
+ * a thin translation on top; a `mux` wrapper or a servlet filter would be
+ * another. What is fixed is the answer, the request to the center and the call
+ * count — everything the fixture can observe from outside.
+ */
+
+import type { CenterAnswer, Introspector } from "./center";
+import { createIntrospector } from "./center";
+import { MESSAGES } from "./messages";
+import type { Decision, IntrospectionConfig, RouteRequirement } from "./types";
+
+/**
+ * The methods RFC 9110 §9.2.1 calls **safe**: they are not expected to change
+ * anything, so default-deny does not apply to them (owner's delegate,
+ * 2026-09-21).
+ *
+ * `HEAD` is here because it is the *same route* as `GET` — Express dispatches
+ * it to the `GET` handler — so refusing it would refuse the cheap form of a
+ * page already served anonymously. `OPTIONS` is here because a CORS preflight
+ * carries no `Authorization` header by definition and a 500 there breaks every
+ * cross-origin call before the real request is sent.
+ *
+ * This exempts them from **default-deny only**. A safe method on a route that
+ * *did* declare a requirement is enforced exactly as any other method is: a
+ * `HEAD` with no credential on a guarded route is still a 401.
+ */
+const SAFE_METHODS: ReadonlySet<string> = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/**
+ * True for `GET`, `HEAD` and `OPTIONS`, compared case-insensitively.
+ *
+ * Case-insensitively because HTTP method tokens are case-sensitive on the wire
+ * but a framework may hand us whatever it parsed, and a client that compared
+ * case-sensitively would treat `get` as a mutation. Scope comparison, by
+ * contrast, is exact and case-sensitive: see {@link decideFrom}.
+ */
+export const isSafeMethod = (method: string): boolean =>
+  SAFE_METHODS.has(method.toUpperCase());
+
+/** One inbound request, reduced to the three things the policy reads. */
+export interface InboundRequest {
+  /**
+   * The HTTP method, any case. Only the safe methods — `GET`, `HEAD` and
+   * `OPTIONS` — are exempt from default-deny.
+   */
+  readonly method: string;
+  /** What the route declares it needs. */
+  readonly requires: RouteRequirement;
+  /** The raw `Authorization` header, or null/undefined when absent. */
+  readonly authorization?: string | null;
+}
+
+/**
+ * Pull the bearer token out of an `Authorization` header.
+ *
+ * The scheme is matched case-insensitively and anything else — `Basic …`, a
+ * bare token, an empty value — reads as no credential at all, exactly as all
+ * five verifiers live today do. Forwarding a non-bearer value to the center
+ * would turn a 401 into a 503 the first time the center was slow.
+ *
+ * The header must be **exactly two** whitespace-separated parts. RFC 6750
+ * credentials are `Bearer` plus one `token68`, so anything else is malformed
+ * and is not repaired:
+ *
+ * - `"Bearer"` and `"Bearer "` carry no token, and are not an empty token to
+ *   ask the center about.
+ * - `"Bearer abc def"` is not the token `abcdef`. A header is never
+ *   concatenated into a token — joining the remainder invents a credential
+ *   nobody issued and sends it to the center.
+ * - `"Bearer a, Bearer b"` — a value that already carries two credentials,
+ *   folded into one line by a proxy — is four parts and reads as no
+ *   credential. Picking one of them would let a caller choose which of two
+ *   credentials a service verifies.
+ *
+ * **Two `Authorization` request headers do not produce that value.** Node's
+ * parser does not join repeats of `Authorization`: it is on the list of
+ * single-value headers it discards duplicates of, so `req.headers.authorization`
+ * — and therefore `req.header("Authorization")` — is the **first** line and the
+ * second is dropped before any of this runs. Verified on the wire in
+ * `credential.test.ts` rather than assumed. The joined shape is still handled
+ * here because a proxy or a framework may fold one, and an array (the shape a
+ * framework may hand back for a repeated header) is joined the way Node joins
+ * a repeatable header and then fails the same count check.
+ */
+export const bearerFrom = (
+  header: string | readonly string[] | null | undefined
+): string | null => {
+  if (header === null || header === undefined) return null;
+  const raw = Array.isArray(header) ? header.join(", ") : (header as string);
+  const parts = raw.trim().split(/\s+/);
+  if (parts.length !== 2) return null;
+  const [scheme, token] = parts as [string, string];
+  if (scheme.toLowerCase() !== "bearer") return null;
+  // Belt and braces, and known to be so: the length check is unreachable as
+  // written, because splitting a TRIMMED non-empty string on whitespace runs
+  // cannot produce an empty part, so `parts.length === 2` already guarantees
+  // both are non-empty. `"Bearer "` trims to `"Bearer"` and fails the count
+  // above instead. A mutation that drops it therefore survives the suite, and
+  // that survival is proven equivalence rather than a missing test. It stays
+  // because it is the invariant the NEXT edit to the split would break.
+  return token.length > 0 ? token : null;
+};
+
+const reject = (
+  status: 401 | 403 | 500 | 503,
+  message: string
+): Decision => ({ outcome: "reject", status, message });
+
+/** Decides what happens to one inbound request. */
+export interface Authorizer {
+  authorize(request: InboundRequest): Promise<Decision>;
+}
+
+/**
+ * Apply the policy to an answer we already have. Split out so the Express
+ * adapter and the tests share one copy of the tail of the rules.
+ */
+const decideFrom = (answer: CenterAnswer, requires: RouteRequirement): Decision => {
+  if (answer.state === "unavailable") {
+    return reject(503, MESSAGES.centerUnavailable);
+  }
+  if (answer.state === "inactive") {
+    // On every method, including a GET that would have been served
+    // anonymously. A bad credential is never downgraded to a visitor.
+    return reject(401, MESSAGES.invalidSession);
+  }
+
+  const { identity } = answer;
+  if (requires === "none" || requires === "session") {
+    // `session` is a tier: a verified session carrying no scopes at all is a
+    // guest operator who may watch but not act, and is allowed through.
+    return { outcome: "proceed", identity };
+  }
+  // Exact membership, and nothing else: not a prefix, not a namespace walk,
+  // not a substring, not a case-fold. `fleet:control:read` does not satisfy
+  // `fleet:control`, and neither does `FLEET:CONTROL`.
+  if (!identity.scopes.includes(requires)) {
+    // 403, not 401 — the session is valid, so re-authenticating would loop.
+    // The message must not name the scope.
+    return reject(403, MESSAGES.missingScope);
+  }
+  return { outcome: "proceed", identity };
+};
+
+/**
+ * Build the authorizer over a live center, or over an injected
+ * {@link Introspector} when a host wants to supply its own transport.
+ */
+export function createAuthorizer(
+  source: IntrospectionConfig | Introspector
+): Authorizer {
+  const introspector: Introspector =
+    "introspect" in source ? source : createIntrospector(source);
+
+  return {
+    async authorize(request: InboundRequest): Promise<Decision> {
+      // Rule order is the rule. Default-deny is settled BEFORE the
+      // Authorization header is read, so a valid token, an expired one and
+      // none at all all get the same answer: the credential a caller did or
+      // did not bring says nothing about a route that declares nothing.
+      if (!isSafeMethod(request.method) && request.requires === "none") {
+        // 500 and not 403: our own routing-table defect. automation-service
+        // maps a 403 to a terminal `credentials` verdict and would abandon a
+        // target over a bug the operator can never fix. The center is not
+        // called — a route that can never be authorized has nothing to verify.
+        return reject(500, MESSAGES.undeclaredRoute);
+      }
+
+      const token = bearerFrom(request.authorization);
+      if (token === null) {
+        if (request.requires === "none") {
+          // A safe method with no credential on a route that declares
+          // nothing: a public read, or a CORS preflight. Nothing to
+          // introspect, so the center is not touched — doing so would put a
+          // synchronous dependency in front of every public page load.
+          return { outcome: "proceed", identity: null };
+        }
+        return reject(401, MESSAGES.missingToken);
+      }
+
+      return decideFrom(await introspector.introspect(token), request.requires);
+    },
+  };
+}
