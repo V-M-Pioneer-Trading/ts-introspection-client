@@ -11,9 +11,10 @@
  * through a `use()` mount.
  *
  * "Not read" is asserted, not inferred: every request passes a trap that
- * records any access to `authorization` on `req.headers` or through
- * `req.get` / `req.header`, and a positive control proves the trap sees an
- * `allowPublic()` route reading it.
+ * records any access to `authorization` on `req.headers`, through
+ * `req.get` / `req.header`, on `req.headersDistinct`, and any read of the
+ * credential's slot in `req.rawHeaders`; positive controls prove the trap
+ * sees an `allowPublic()` route reading it and sees each of the side doors.
  */
 
 import express from "express";
@@ -64,27 +65,54 @@ beforeEach(() => {
 const isAuthorization = (key: PropertyKey): boolean =>
   typeof key === "string" && key.toLowerCase() === "authorization";
 
-/**
- * Replaces `req.headers` with a Proxy and `req.get` / `req.header` with
- * recording wrappers. Mounted first, as a passthrough, so everything after it
- * — the declaration included — sees only the trapped request.
- */
-const trap = passthrough((req: any, _res: any, next: any): void => {
-  const headers = req.headers as Record<string, unknown>;
-  req.headers = new Proxy(headers, {
-    get(target, key, receiver) {
-      if (isAuthorization(key)) reads.push("headers.get");
-      return Reflect.get(target, key, receiver);
+/** A Proxy over a header map that records every look at `authorization`. */
+const recordingMap = <T extends object>(target: T, label: string): T =>
+  new Proxy(target, {
+    get(t, key, receiver) {
+      if (isAuthorization(key)) reads.push(`${label}.get`);
+      return Reflect.get(t, key, receiver);
     },
-    has(target, key) {
-      if (isAuthorization(key)) reads.push("headers.has");
-      return Reflect.has(target, key);
+    has(t, key) {
+      if (isAuthorization(key)) reads.push(`${label}.has`);
+      return Reflect.has(t, key);
     },
-    getOwnPropertyDescriptor(target, key) {
-      if (isAuthorization(key)) reads.push("headers.descriptor");
-      return Reflect.getOwnPropertyDescriptor(target, key);
+    getOwnPropertyDescriptor(t, key) {
+      if (isAuthorization(key)) reads.push(`${label}.descriptor`);
+      return Reflect.getOwnPropertyDescriptor(t, key);
     },
   });
+
+/**
+ * Replaces `req.headers` and `req.headersDistinct` with recording Proxies,
+ * `req.rawHeaders` with a Proxy that records any read of a value whose name
+ * is `authorization`, and `req.get` / `req.header` with recording
+ * wrappers. Mounted first, as a passthrough, so everything after it — the
+ * declaration included — sees only the trapped request.
+ */
+const trap = passthrough((req: any, _res: any, next: any): void => {
+  // Read before `rawHeaders` is replaced: Node builds it lazily FROM
+  // `rawHeaders`, and the trap must not record its own setup.
+  const distinct = req.headersDistinct as Record<string, unknown>;
+  Object.defineProperty(req, "headersDistinct", {
+    configurable: true,
+    enumerable: true,
+    value: recordingMap(distinct, "headersDistinct"),
+  });
+  const raw = req.rawHeaders as string[];
+  req.rawHeaders = new Proxy(raw, {
+    get(target, key, receiver) {
+      // [name, value, name, value, …]: the credential is the odd slot after
+      // an `authorization` name. Reading names is not reading the credential.
+      if (typeof key === "string" && /^\d+$/.test(key)) {
+        const index = Number(key);
+        if (index % 2 === 1 && isAuthorization(target[index - 1] ?? "")) {
+          reads.push("rawHeaders.value");
+        }
+      }
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  req.headers = recordingMap(req.headers as Record<string, unknown>, "headers");
   const original = req.get as (name: string) => unknown;
   req.get = req.header = function (this: unknown, name: string): unknown {
     if (isAuthorization(name)) reads.push("req.get");
@@ -170,6 +198,38 @@ describe("ignoreCredentials() on a GET route", () => {
     expect(reads.length).toBeGreaterThan(0);
     expect(calls).toEqual(["expired.token"]);
   });
+
+  it.each([
+    [
+      "rawHeaders",
+      "rawHeaders.value",
+      (req: any): unknown => {
+        const raw = req.rawHeaders as string[];
+        const at = raw.findIndex((v, i) => i % 2 === 0 && v.toLowerCase() === "authorization");
+        return raw[at + 1];
+      },
+    ],
+    ["rawHeaders, iterated", "rawHeaders.value", (req: any): unknown => [...req.rawHeaders].join(",")],
+    ["headersDistinct", "headersDistinct.get", (req: any): unknown => req.headersDistinct.authorization],
+    ["headersDistinct, spread", "headersDistinct.descriptor", (req: any): unknown => ({ ...req.headersDistinct })],
+  ])(
+    "POSITIVE CONTROL: the trap sees a read through %s",
+    async (_label, recorded, read) => {
+      // Without these, a mutant reading the credential through a side door
+      // of IncomingMessage would pass the assertions above unseen.
+      const { auth } = countingAuth();
+      const app = secured(express());
+      app.use(trap);
+      app.get("/leak", auth.ignoreCredentials(), (req, res) => {
+        res.json({ leaked: read(req) !== undefined });
+      });
+      const response = await request(app)
+        .get("/leak")
+        .set("Authorization", "Bearer operator.token");
+      expect(response.status).toBe(200);
+      expect(reads).toContain(recorded);
+    }
+  );
 
   it("stays up while the center is down, where allowPublic() answers 503", async () => {
     // A real config pointing at a port nothing listens on, and a spy on the
@@ -377,6 +437,29 @@ describe("a mutating request that reaches it through a use() mount", () => {
     }
   );
 
+  it("hands no identity on the 500 either, even behind a guard that verified one", async () => {
+    const { auth, calls } = countingAuth();
+    const app = secured(express());
+    let seen: unknown = "unset";
+    app.use(
+      passthrough((_req: any, res: any, next: any) => {
+        res.on("finish", () => {
+          seen = identityOf(res);
+        });
+        next();
+      }, "test probe; never answers")
+    );
+    app.use(auth.guard("session"));
+    app.use("/assets", auth.ignoreCredentials(), report());
+    const response = await request(app)
+      .post("/assets/x")
+      .set("Authorization", "Bearer operator.token");
+    expect(response.status).toBe(500);
+    // The outer guard verified the operator; the mount still hands out none.
+    expect(calls).toEqual(["operator.token"]);
+    expect(seen).toBeNull();
+  });
+
   it("reports the requirement on the 500 too", async () => {
     const { auth } = countingAuth();
     const app = secured(express());
@@ -452,6 +535,22 @@ describe("ignoreCredentials() obeys the declaration rules", () => {
     expect(() =>
       app.use("/z", auth.ignoreCredentials(), second(auth), h)
     ).toThrow(/more than one authorization declaration/);
+  });
+
+  it("names the mutation rule, not the double declaration, on a mutating route carrying both", () => {
+    // `post("/x", requireSession(), ignore, h)` breaks two rules. The fix is
+    // to drop ignoreCredentials(), so that is the rule the message names.
+    const { auth } = countingAuth();
+    const app = secured(express());
+    let message = "";
+    try {
+      app.post("/x", auth.requireSession(), auth.ignoreCredentials(), h);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toMatch(/^app\.post\(\/x\) was registered with ignoreCredentials\(\)\./);
+    expect(message).toMatch(/accepted only on get, head and options routes/);
+    expect(message).not.toMatch(/more than one authorization declaration/);
   });
 
   it("is refused as a second declaration on a route() chain", () => {

@@ -784,11 +784,33 @@ function secureTarget<T extends object>(target: T, isRoute: boolean): T {
         args,
         false
       );
+      // Order is load-bearing: `post("/x", requireSession(), ignore, h)`
+      // is two declarations AND ignoreCredentials() on a mutation, and the
+      // message must name the mutation rule — the fix is to drop the
+      // ignoreCredentials(), not to pick one of two equals.
       assertIgnoreOnSafeMethod(method, args, name);
       assertRouteDeclared(method, args, name, state);
       return call(...args);
     };
   }
+
+  // Express 4's deprecated `app.del` is `deprecate.function(app.delete)`:
+  // it holds the ORIGINAL `delete`, captured when Express loaded, so the
+  // patch above never sees a call made through it and `app.del("/d", h)`
+  // registered and served an undeclared DELETE. Refused rather than
+  // forwarded: a deprecated spelling of a mutating method has no caller worth
+  // keeping, and one route method with two spellings is one more thing to
+  // audit. Installed on routers and routes too, which have no `del` of their
+  // own, so the spelling means the same thing on every secured target.
+  record["del"] = (...args: unknown[]): never => {
+    throw new Error(
+      `${name}.del(${describePath(args[0])}) is Express 4's deprecated alias for delete(), and is refused.\n\n` +
+        "It calls the delete() Express captured when it loaded, not the one\n" +
+        "secured() checks, so a route registered through it would carry no\n" +
+        "declaration check at all. Use delete(...):\n\n" +
+        `    ${name}.delete(${describePath(args[0])}, auth.requireScope("…"), handler)`
+    );
+  };
 
   const originalUse = record["use"];
   if (typeof originalUse === "function") {
@@ -851,9 +873,9 @@ export interface ExpressAuth {
    * parameter all resolve exactly as the route does — and a `HEAD` reaches the
    * `GET` route's declaration because Express dispatches it to that route.
    *
-   * Throws at startup for `"none"` and `"session"`, which are the reserved
-   * words for the other two intents: `requireScope("none")` reads as a demand
-   * and silently produced a **public** route.
+   * Throws at startup for `"none"`, `"session"` and `"ignore-credentials"`,
+   * which are the reserved words for the other intents: `requireScope("none")`
+   * reads as a demand and silently produced a **public** route.
    */
   requireScope(scope: string): HandlerLike;
   /** Any verified session, carrying any scopes at all, including none. */
@@ -1025,6 +1047,10 @@ export function createExpressAuth(
     const handler: HandlerLike = (req, res, next) => {
       const state = stateOf(res);
       state.requires = CREDENTIALS_IGNORED;
+      // Even if an outer guard verified someone, this route declared it does
+      // not read identity, so it is handed none — on the 500 below as well,
+      // where an error handler or a `finish` listener may still ask.
+      state.identity = null;
       if (!isSafeMethod(req.method)) {
         // Registration refuses this on a mutating route; a `use()` mount
         // still sees every method. Same answer as `allowPublic()` gives,
@@ -1032,9 +1058,6 @@ export function createExpressAuth(
         sendRejection(res, 500, MESSAGES.undeclaredRoute);
         return;
       }
-      // Even if an outer guard verified someone, this route declared it does
-      // not read identity, so it is handed none.
-      state.identity = null;
       next();
     };
     declarations.set(handler, CREDENTIALS_IGNORED);

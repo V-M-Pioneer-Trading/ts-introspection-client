@@ -19,6 +19,8 @@
  * count calls, which is half of what these tests assert.
  */
 
+import { METHODS } from "node:http";
+
 import express, { type Express } from "express";
 import request from "supertest";
 
@@ -586,5 +588,92 @@ describe("S3. one inbound request asks the center at most once", () => {
       .set("Authorization", "Bearer operator.token");
     expect(response.status).toBe(401);
     expect(calls).toEqual(["operator.token", "second.token"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// B3. No alias reaches the unpatched methods
+// ---------------------------------------------------------------------------
+
+/**
+ * Express 4's `app.del` is `deprecate.function(app.delete)`: a wrapper around
+ * the ORIGINAL delete, captured when Express loaded. Patching `app.delete`
+ * never touched it, so 1.0.0 registered `secured(app).del("/d", h)` without a
+ * declaration and served the DELETE.
+ */
+describe("B3. no alias reaches the unpatched route methods", () => {
+  type Loose = Record<string, (...args: unknown[]) => unknown>;
+  const DEL_REFUSED = /del\(\/d\) is Express 4's deprecated alias for delete\(\), and is refused/;
+
+  it("refuses app.del(), undeclared or declared, and serves nothing", async () => {
+    const app = secured(express());
+    const loose = app as unknown as Loose;
+    expect(() => loose["del"]!("/d", handler("undeclared"))).toThrow(DEL_REFUSED);
+    expect(() =>
+      loose["del"]!("/d", auth().requireScope("fleet:control"), handler("declared"))
+    ).toThrow(/Use delete\(\.\.\.\)/);
+
+    const response = await request(app)
+      .delete("/d")
+      .set("Authorization", "Bearer operator.token");
+    expect(response.status).toBe(404);
+    expect(ran).toEqual([]);
+  });
+
+  it("refuses router.del() and route().del() the same way", async () => {
+    const router = secured(express.Router());
+    const loose = router as unknown as Loose;
+    expect(() => loose["del"]!("/d", handler())).toThrow(DEL_REFUSED);
+    const route = router.route("/r") as unknown as Loose;
+    expect(() => route["del"]!(handler())).toThrow(/deprecated alias for delete\(\)/);
+
+    const app = secured(express());
+    app.use(router);
+    const response = await request(app).delete("/d");
+    expect(response.status).toBe(404);
+    expect(ran).toEqual([]);
+  });
+
+  it("refuses an undeclared delete on route() from an app and from a router", async () => {
+    const app = secured(express());
+    const router = secured(express.Router());
+    expect(() => router.route("/x").delete(handler())).toThrow(
+      /route\(\/x\)\.delete\(<no path>\) was registered without an authorization declaration/
+    );
+    expect(() => app.route("/y").delete(handler())).toThrow(
+      /without an authorization declaration/
+    );
+    app.use(router);
+    expect((await request(app).delete("/x")).status).toBe(404);
+    expect((await request(app).delete("/y")).status).toBe(404);
+    expect(ran).toEqual([]);
+  });
+
+  it("leaves no route method or alias on a target still pointing at Express's own", () => {
+    // The audit, made executable: every name Express 4 registers a route
+    // under, plus the `del` alias, must no longer be the function Express
+    // installed. `express()` COPIES application.js onto each app, so an own
+    // property proves nothing; identity with Express's original does.
+    const unsecured = express.Router();
+    const routeProto = Object.getPrototypeOf(unsecured.route("/p")) as Loose;
+    const originals: ReadonlyArray<[string, Loose, Loose]> = [
+      ["app", secured(express()) as unknown as Loose, express.application as unknown as Loose],
+      ["router", secured(express.Router()) as unknown as Loose, Object.getPrototypeOf(unsecured) as Loose],
+      ["route", secured(express.Router()).route("/z") as unknown as Loose, routeProto],
+    ];
+    const names = [...METHODS.map((m) => m.toLowerCase()), "all", "del", "use", "route"];
+    const stillOriginal: string[] = [];
+    let checked = 0;
+    for (const [label, target, express4] of originals) {
+      for (const n of names) {
+        if (typeof express4[n] !== "function") continue;
+        checked += 1;
+        if (target[n] === express4[n]) stillOriginal.push(`${label}.${n}`);
+      }
+    }
+    expect(stillOriginal).toEqual([]);
+    // app.del exists in Express 4, so it was among the names checked.
+    expect(typeof (express.application as unknown as Loose)["del"]).toBe("function");
+    expect(checked).toBeGreaterThan(3 * 30);
   });
 });

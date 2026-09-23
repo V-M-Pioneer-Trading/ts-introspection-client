@@ -139,10 +139,13 @@ A fence whose gaps are unknown is worse than no fence.
   (A reference taken *before* `secured()` is fine: it patches in place, so
   every alias goes through the patched methods.)
 - **A Route obtained around the patch** — `Object.getPrototypeOf(router).route
-  .call(router, "/x").get(handler)` — and a layer pushed straight onto
-  `router.stack`. Both reach Express's internals without passing through any
-  method this package replaced. Closing them would mean mutating Express's own
-  prototypes.
+  .call(router, "/x").get(handler)` — a layer pushed straight onto
+  `router.stack`, and a route registered on an app's private `app._router`.
+  All three reach Express's internals without passing through any method this
+  package replaced. Closing them would mean mutating Express's own prototypes.
+  Express 4's public alias `app.del()` — which calls the `delete` Express
+  captured at load, not the patched one — *is* closed: a secured target refuses
+  it at registration.
 - **The existence of a route, on an automatic `OPTIONS`.** Express replies
   before any layer on the route runs, so no handler executes and nothing is
   authorized away — but the path and its method list are disclosed to an
@@ -229,6 +232,14 @@ const onError: ErrorRequestHandler = (_err, _req, res, _next) => {
 app.use(onError);
 ```
 
+**Always give an `ignoreCredentials()` or `allowPublic()` mount a path.**
+`app.use("/assets", auth.ignoreCredentials(), express.static(assetDir))` covers
+`/assets` only. Written without the path, the same mount matches every request,
+and every mutating request that reaches it — including a `POST` meant for a
+route registered further down — is answered `500` there, because a mount sees
+every method and neither declaration lets a mutation through. It fails closed,
+but it takes every write in the service down with it.
+
 **A generated router is the one construct startup checking cannot see inside.**
 `RegisterRoutes()` registers onto a plain `express.Router()`, which is not
 `secured()` — it cannot be, because the routes it adds carry no declarations
@@ -296,6 +307,12 @@ On a route declared `ignoreCredentials()`, `identityOf`, `actorOf` and
 `kindOf` are `null` and `hasScope` is `false` whatever the caller sent, even
 behind a `guard()` that verified someone; `requirementOf` is
 `"ignore-credentials"` (exported as `CREDENTIALS_IGNORED`).
+When a request passes more than one enforcement point — a `guard()` on the
+mount and the route's own declaration, or nested declared mounts —
+`requirementOf` reports the **innermost** one, the last to run: under
+`guard("session")`, a route declaring `requireScope("fleet:control")` reports
+`"fleet:control"`, and one declaring `ignoreCredentials()` reports
+`"ignore-credentials"`. Every enforcement point on the way was still checked.
 There is deliberately no second copy of `kind`: a knob fence is
 `kindOf(res) === "machine"`, never a look at the `sub` prefix.
 

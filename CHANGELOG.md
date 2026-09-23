@@ -1,8 +1,21 @@
 # Changelog
 
-## 1.1.0 — unreleased
+## 1.1.0 — 2026-09-23
 
-Additive. Part of V-M-Pioneer-Trading/meta#80 (step 5).
+Additive, plus one security fix. Part of V-M-Pioneer-Trading/meta#80 (step 5).
+
+### Security
+
+- **`secured(app).del(...)` registered an undeclared route (present in 1.0.0).**
+  Express 4's deprecated `app.del` is a wrapper around the `delete` Express
+  captured when it loaded, so it bypassed the patched `delete` entirely:
+  `secured(app).del("/d", handler)` registered with no declaration and served
+  the `DELETE` to anyone. A secured app, router or route now refuses `del()` at
+  registration, naming `delete(...)` as the spelling to use. No other Express 4
+  route method or alias still points at Express's own function after
+  `secured()`; a test pins that. Upgrade any service on 1.0.0.
+
+### Added
 
 - `auth.ignoreCredentials()`: a declaration for routes that never read
   identity (health, API docs, static files). The `Authorization` header is
@@ -14,6 +27,10 @@ Additive. Part of V-M-Pioneer-Trading/meta#80 (step 5).
 - `"ignore-credentials"` is reserved: `requireScope()` and a fixed `guard()`
   refuse it, and a `guard()` resolver returning it is undeclared (`500`).
 - `allowPublic()`, `authorize()` and the fixture are unchanged.
+- **`ExpressAuth` gained a member** (`ignoreCredentials`). Code that only
+  calls `createExpressAuth()` is unaffected; a hand-written object typed as
+  `ExpressAuth` (a test double, a wrapper) no longer typechecks until it adds
+  one.
 
 ## 1.0.0 — 2026-09-23
 
