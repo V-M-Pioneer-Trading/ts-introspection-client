@@ -69,7 +69,7 @@ import { METHODS } from "node:http";
 import type { CenterAnswer, Introspector } from "./center";
 import { createIntrospector } from "./center";
 import type { Authorizer } from "./core";
-import { createAuthorizer } from "./core";
+import { createAuthorizer, isSafeMethod } from "./core";
 import { MESSAGES } from "./messages";
 import type {
   Decision,
@@ -149,7 +149,7 @@ interface RequestState {
   /** The center's verdict for this request, once something has enforced. */
   identity?: Identity | null;
   /** What the matched route declared, or null when it declared nothing. */
-  requires?: RouteRequirement | null;
+  requires?: DeclaredRequirement | null;
   /** One request's memoized center answer, and a digest of the header it was about. */
   memo?: { readonly digest: string; readonly answer: Promise<CenterAnswer> };
 }
@@ -209,8 +209,19 @@ export const kindOf = (res: ResponseLike): Kind | null =>
 export const hasScope = (res: ResponseLike, scope: string): boolean =>
   identityOf(res)?.scopes.includes(scope) ?? false;
 
+/**
+ * What {@link requirementOf} reports for a route declared
+ * {@link ExpressAuth.ignoreCredentials}. Reserved: `requireScope()` and a
+ * fixed `guard()` refuse it, and a resolver returning it is undeclared, so it
+ * never means anything else.
+ */
+export const CREDENTIALS_IGNORED = "ignore-credentials";
+
+/** A {@link RouteRequirement}, or a route that declared it never reads identity. */
+export type DeclaredRequirement = RouteRequirement | typeof CREDENTIALS_IGNORED;
+
 /** What the route this request matched declared, or null if it declared nothing. */
-export const requirementOf = (res: ResponseLike): RouteRequirement | null =>
+export const requirementOf = (res: ResponseLike): DeclaredRequirement | null =>
   requestState.get(res)?.requires ?? null;
 
 /**
@@ -256,9 +267,14 @@ export interface GuardContext {
  */
 
 /** Handlers that carry a route declaration, and what they declare. */
-const declarations = new WeakMap<object, RouteRequirement>();
+const declarations = new WeakMap<object, DeclaredRequirement>();
 /** Router-level guards: a blanket declaration for everything behind them. */
 const guards = new WeakSet<object>();
+/**
+ * The subset of {@link declarations} made by `ignoreCredentials()`, which are
+ * accepted only where every method the registration covers is safe.
+ */
+const credentialIgnorers = new WeakSet<object>();
 /** Handlers a caller has explicitly vouched for as not being a route. */
 const passthroughs = new WeakSet<object>();
 /** Terminal not-found handlers: they serve no resource, so they declare none. */
@@ -439,7 +455,8 @@ const ROUTE_METHODS: readonly string[] = [
 const HOW_TO_DECLARE = [
   "Every route must say what it needs, as its FIRST handler:",
   "",
-  "    auth.allowPublic()                 — anyone, including an anonymous visitor",
+  "    auth.ignoreCredentials()           — never reads identity: health, docs, static files",
+  "    auth.allowPublic()                 — anyone; a presented bearer is still verified",
   "    auth.requireSession()              — any verified session",
   '    auth.requireScope("fleet:control") — a session carrying that scope',
   "",
@@ -556,6 +573,40 @@ const assertRouteDeclared = (
   }
 
   state.declaredMethods.add(label);
+};
+
+/**
+ * Route registrations `ignoreCredentials()` may lead: the ones whose every
+ * method is safe. An allowlist, so `all`, `trace`, `propfind` and whatever
+ * Node adds next are refused rather than audited.
+ */
+const IGNORE_CREDENTIALS_METHODS: ReadonlySet<string> = new Set([
+  "get",
+  "head",
+  "options",
+]);
+
+/**
+ * Refuse `ignoreCredentials()` on a registration that covers a mutating method.
+ *
+ * A mutation that reads no credential is the same defect `allowPublic()`
+ * answers 500 for; here it is caught before the process starts. Checked
+ * before the positional rules so the message names the real mistake.
+ */
+const assertIgnoreOnSafeMethod = (
+  method: string,
+  args: readonly unknown[],
+  name: string
+): void => {
+  if (IGNORE_CREDENTIALS_METHODS.has(method)) return;
+  if (!handlerList(args).some((h) => isBranded(credentialIgnorers, h))) return;
+  throw new Error(
+    `${name}.${method}(${describePath(args[0])}) was registered with ignoreCredentials().\n\n` +
+      "ignoreCredentials() is accepted only on get, head and options routes and on\n" +
+      "use() mounts, because a mutation that reads no credential is a defect, not\n" +
+      "a policy. A mutating route declares what it needs:\n\n" +
+      `    ${name}.${method}(${describePath(args[0])}, auth.requireScope("…"), handler)`
+  );
 };
 
 /**
@@ -733,6 +784,7 @@ function secureTarget<T extends object>(target: T, isRoute: boolean): T {
         args,
         false
       );
+      assertIgnoreOnSafeMethod(method, args, name);
       assertRouteDeclared(method, args, name, state);
       return call(...args);
     };
@@ -815,6 +867,22 @@ export interface ExpressAuth {
    * a public route, it is an undeclared one.
    */
   allowPublic(): HandlerLike;
+  /**
+   * Declare a route that **never reads identity**: health, API docs, static
+   * files. The `Authorization` header is not read and the center is never
+   * called, so a valid, expired or garbage bearer all get the same answer and
+   * the route stays up while auth-service is down. `identityOf(res)` is null
+   * and `requirementOf(res)` is {@link CREDENTIALS_IGNORED}.
+   *
+   * Contrast {@link allowPublic}, for reads whose answer depends on an
+   * *optional* identity: there a presented bearer is verified, so an expired
+   * one is a 401 and a down center a 503.
+   *
+   * Refused at registration on anything but `get`, `head`, `options` and
+   * `use()`. A mutating method that still reaches it through a `use()` mount
+   * answers `500` before any header is read.
+   */
+  ignoreCredentials(): HandlerLike;
   /**
    * Router-level middleware, for routes that cannot carry a declaration —
    * generated routers, chiefly. Mount once with `router.use(auth.guard(...))`.
@@ -906,6 +974,10 @@ export function createExpressAuth(
       } catch {
         requires = undefined;
       }
+      // The reserved word is a declaration, not resolver vocabulary. Read as
+      // a scope it would be enforced as one while `requirementOf` reported
+      // the opposite, so it is undeclared instead.
+      if (requires === CREDENTIALS_IGNORED) requires = undefined;
 
       if (requires === undefined) {
         // Undeclared. A resolver that threw has told us nothing about this
@@ -945,6 +1017,36 @@ export function createExpressAuth(
     return handler;
   };
 
+  /**
+   * The `ignoreCredentials()` handler. It reads `req.method` and nothing else
+   * of the request: no header, no center, no memo.
+   */
+  const ignoring = (): HandlerLike => {
+    const handler: HandlerLike = (req, res, next) => {
+      const state = stateOf(res);
+      state.requires = CREDENTIALS_IGNORED;
+      if (!isSafeMethod(req.method)) {
+        // Registration refuses this on a mutating route; a `use()` mount
+        // still sees every method. Same answer as `allowPublic()` gives,
+        // decided before any header is read.
+        sendRejection(res, 500, MESSAGES.undeclaredRoute);
+        return;
+      }
+      // Even if an outer guard verified someone, this route declared it does
+      // not read identity, so it is handed none.
+      state.identity = null;
+      next();
+    };
+    declarations.set(handler, CREDENTIALS_IGNORED);
+    credentialIgnorers.add(handler);
+    return handler;
+  };
+
+  const RESERVED_HELP =
+    "    a route that never reads identity — auth.ignoreCredentials()\n" +
+    "    a public route                    — auth.allowPublic()\n" +
+    "    any verified session              — auth.requireSession()\n\n";
+
   return {
     requireScope: (scope) => {
       if (typeof scope !== "string" || scope.trim().length === 0) {
@@ -952,11 +1054,10 @@ export function createExpressAuth(
           "requireScope() takes a scope literal, such as requireScope(\"fleet:control\")"
         );
       }
-      if (scope === "none" || scope === "session") {
+      if (scope === "none" || scope === "session" || scope === CREDENTIALS_IGNORED) {
         throw new TypeError(
           `requireScope("${scope}") is not a scope: "${scope}" is reserved.\n\n` +
-            "    a public route      — auth.allowPublic()\n" +
-            "    any verified session — auth.requireSession()\n\n" +
+            RESERVED_HELP +
             "Spelled as a scope it read as a demand and silently produced the " +
             "opposite."
         );
@@ -965,7 +1066,14 @@ export function createExpressAuth(
     },
     requireSession: () => declaring("session"),
     allowPublic: () => declaring("none"),
+    ignoreCredentials: ignoring,
     guard: (resolve) => {
+      if (resolve === CREDENTIALS_IGNORED) {
+        throw new TypeError(
+          `guard("${CREDENTIALS_IGNORED}") is not a requirement: it is reserved.\n\n` +
+            RESERVED_HELP
+        );
+      }
       const handler = handlerFor(
         typeof resolve === "function" ? resolve : () => resolve
       );
