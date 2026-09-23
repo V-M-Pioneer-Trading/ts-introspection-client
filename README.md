@@ -22,7 +22,7 @@ URL, which `package-lock.json` records with an integrity hash, so the Docker
 build needs no token and no git.
 
 ```sh
-npm install https://github.com/V-M-Pioneer-Trading/ts-introspection-client/releases/download/v1.0.0/v-m-pioneer-trading-introspection-client-1.0.0.tgz
+npm install https://github.com/V-M-Pioneer-Trading/ts-introspection-client/releases/download/v1.1.0/v-m-pioneer-trading-introspection-client-1.1.0.tgz
 ```
 
 ## Quick start
@@ -41,7 +41,7 @@ const auth = createExpressAuth(loadIntrospectionConfig()); // throws, naming a m
 const app = secured(express());
 const api = secured(express.Router());
 
-api.get("/health", auth.allowPublic(), (_req, res) => res.json({ status: "ok" }));
+api.get("/health", auth.ignoreCredentials(), (_req, res) => res.json({ status: "ok" }));
 api.get("/targets", auth.requireSession(), listTargets);
 api.post("/targets", auth.requireScope("fleet:control"), (req, res) =>
   res.json({ by: actorOf(res) })
@@ -53,16 +53,30 @@ app.use(notFound((_req, res) => res.status(404).json({ error: { message: "not fo
 
 The declaration is the route's **first** handler. Leave it off, put it second,
 or write two, and the process does not start, with a message naming the route
-and listing the three spellings.
+and listing the spellings:
+
+| Declaration | `Authorization` header | Center | Mutating methods |
+|---|---|---|---|
+| `ignoreCredentials()` | never read; identity `null` | never called | refused at registration; `500` via a `use()` mount |
+| `allowPublic()` | optional; if presented, verified | called when a bearer is presented | `500` |
+| `requireSession()` | required | called | enforced |
+| `requireScope(scope)` | required, session must carry `scope` | called | enforced |
+
+`ignoreCredentials()` is for routes that never read identity (health, API
+docs, static files); `allowPublic()` is for reads whose answer depends on an
+optional identity. They differ because `allowPublic()` verifies a bearer it is
+shown, so an expired token is a `401` and a down center a `503` even on a
+public page, which is right for a personalised read and wrong for a health
+check.
 
 ## Security model
 
 **P1. A route with no declaration is never served — on any method, including
 `GET`, `HEAD` and `OPTIONS`.** "Public" is a thing a route says out loud with
-`allowPublic()`, never a thing that happens because a lookup missed. A
-`guard()` resolver returning `undefined` or throwing is *undeclared*, which is
-`500 this route declares no required scope`, decided before the `Authorization`
-header is read and without calling the center. There is no fallback to
+`allowPublic()` or `ignoreCredentials()`, never a thing that happens because
+a lookup missed. A `guard()` resolver returning `undefined` or throwing is
+*undeclared*, which is `500 this route declares no required scope`, decided
+before the `Authorization` header is read and without calling the center. There is no fallback to
 `"none"`.
 
 > This is an **adapter** rule about a missing declaration, not the fixture's
@@ -125,10 +139,13 @@ A fence whose gaps are unknown is worse than no fence.
   (A reference taken *before* `secured()` is fine: it patches in place, so
   every alias goes through the patched methods.)
 - **A Route obtained around the patch** — `Object.getPrototypeOf(router).route
-  .call(router, "/x").get(handler)` — and a layer pushed straight onto
-  `router.stack`. Both reach Express's internals without passing through any
-  method this package replaced. Closing them would mean mutating Express's own
-  prototypes.
+  .call(router, "/x").get(handler)` — a layer pushed straight onto
+  `router.stack`, and a route registered on an app's private `app._router`.
+  All three reach Express's internals without passing through any method this
+  package replaced. Closing them would mean mutating Express's own prototypes.
+  Express 4's public alias `app.del()` — which calls the `delete` Express
+  captured at load, not the patched one — *is* closed: a secured target refuses
+  it at registration.
 - **The existence of a route, on an automatic `OPTIONS`.** Express replies
   before any layer on the route runs, so no handler executes and nothing is
   authorized away — but the path and its method list are disclosed to an
@@ -172,9 +189,11 @@ import type { ErrorRequestHandler } from "express";
 
 const app = secured(express());
 
-// 1. Health routes: public is declared out loud, and a bare `app.get` is not.
-app.get("/health", auth.allowPublic(), health);
-app.get("/api/fleet/health", auth.allowPublic(), health);
+// 1. Health routes never read identity: the header is not read and the
+//    center is not called, so they stay up while auth-service is down.
+//    allowPublic() is for reads whose answer depends on an OPTIONAL identity.
+app.get("/health", auth.ignoreCredentials(), health);
+app.get("/api/fleet/health", auth.ignoreCredentials(), health);
 
 // 2. A generated router (tsoa) has no call site for a declaration, so the
 //    guard goes on the MOUNT, ahead of it. The resolver is a function of the
@@ -190,8 +209,9 @@ app.use(
 
 // 3. A DECLARED MOUNT: the leading declaration covers everything after it, so
 //    third-party middleware that cannot be branded needs no wrapper.
-app.use("/api/fleet/swagger", auth.allowPublic(), swaggerUi.serve, swaggerUi.setup(spec));
-app.use("/assets", auth.allowPublic(), express.static(assetDir));
+//    Swagger and static files never read identity either.
+app.use("/api/fleet/swagger", auth.ignoreCredentials(), swaggerUi.serve, swaggerUi.setup(spec));
+app.use("/assets", auth.ignoreCredentials(), express.static(assetDir));
 app.use("/proxy", auth.requireSession(), express.raw({ type: "*/*", limit: "5mb" }), proxy);
 
 // 4. Middleware that never answers says so, once, with a reason.
@@ -211,6 +231,14 @@ const onError: ErrorRequestHandler = (_err, _req, res, _next) => {
 };
 app.use(onError);
 ```
+
+**Always give an `ignoreCredentials()` or `allowPublic()` mount a path.**
+`app.use("/assets", auth.ignoreCredentials(), express.static(assetDir))` covers
+`/assets` only. Written without the path, the same mount matches every request,
+and every mutating request that reaches it — including a `POST` meant for a
+route registered further down — is answered `500` there, because a mount sees
+every method and neither declaration lets a mutation through. It fails closed,
+but it takes every write in the service down with it.
 
 **A generated router is the one construct startup checking cannot see inside.**
 `RegisterRoutes()` registers onto a plain `express.Router()`, which is not
@@ -249,7 +277,9 @@ st-gateway is the one consumer that does **not** secure its app: `/proxy`
 forwards anonymous mutations by design (`POST /register` carries the caller's
 own account token, and auth-service polls `GET /` with no credential), and this
 package has no spelling for "a mutating route that needs no credential" —
-`allowPublic()` answers `500` there, deliberately. The gateway uses
+`allowPublic()` answers `500` there, and `ignoreCredentials()` refuses to
+register on a mutating method and answers `500` if one reaches it through a
+mount, deliberately. The gateway uses
 `createLaneDeriver` only; the declared mount above is what it would write if it
 ever authorized.
 
@@ -273,6 +303,16 @@ to read instead — the identity, the requirement and the memo are all in the on
 place, and none of them appears in `Object.keys(res.locals)`, in a
 `JSON.stringify` of it, or in `util.inspect(res.locals, { showHidden: true })`,
 which *does* print Symbol-keyed properties.
+On a route declared `ignoreCredentials()`, `identityOf`, `actorOf` and
+`kindOf` are `null` and `hasScope` is `false` whatever the caller sent, even
+behind a `guard()` that verified someone; `requirementOf` is
+`"ignore-credentials"` (exported as `CREDENTIALS_IGNORED`).
+When a request passes more than one enforcement point — a `guard()` on the
+mount and the route's own declaration, or nested declared mounts —
+`requirementOf` reports the **innermost** one, the last to run: under
+`guard("session")`, a route declaring `requireScope("fleet:control")` reports
+`"fleet:control"`, and one declaring `ignoreCredentials()` reports
+`"ignore-credentials"`. Every enforcement point on the way was still checked.
 There is deliberately no second copy of `kind`: a knob fence is
 `kindOf(res) === "machine"`, never a look at the `sub` prefix.
 
@@ -282,7 +322,7 @@ There is deliberately no second copy of `kind`: a knob fence is
 
 | Export | What it is |
 |---|---|
-| `createExpressAuth(config \| introspector \| authorizer)` | `requireScope(scope)`, `requireSession()`, `allowPublic()`, `guard(requirement \| resolver)` |
+| `createExpressAuth(config \| introspector \| authorizer)` | `requireScope(scope)`, `requireSession()`, `allowPublic()`, `ignoreCredentials()`, `guard(requirement \| resolver)` |
 | `secured(routerOrAppOrRoute)` | Patches in place; enforces the registration rules. Idempotent |
 | `passthrough(handler, why)` | Returns a branded wrapper around middleware that never serves a resource |
 | `notFound(handler)` | Returns a branded wrapper that forces a 404; accepted only as `use(notFound(h))`, last |
@@ -291,11 +331,13 @@ There is deliberately no second copy of `kind`: a knob fence is
 | `createLaneDeriver(config \| introspector)` | st-gateway's lane policy |
 | `createIntrospector(config)`, `splitScopes`, `bearerFrom`, `isSafeMethod` | The pieces underneath |
 | `loadIntrospectionConfig(env?)`, `IntrospectionConfigError` | Startup validation |
-| `MESSAGES`, `SECRET_HEADER`, `ENV_URL`, `ENV_SECRET`, `DEFAULT_TIMEOUT_MS`, `DEFAULT_MAX_RESPONSE_BYTES` | Constants |
+| `MESSAGES`, `CREDENTIALS_IGNORED`, `SECRET_HEADER`, `ENV_URL`, `ENV_SECRET`, `DEFAULT_TIMEOUT_MS`, `DEFAULT_MAX_RESPONSE_BYTES` | Constants |
 
-`requireScope` throws at startup for `""`, whitespace, `"none"` and
-`"session"`: the last two are the reserved words for the other two intents, and
-spelled as a scope each read as a demand while silently producing its opposite.
+`requireScope` throws at startup for `""`, whitespace, `"none"`, `"session"`
+and `"ignore-credentials"`: the last three are the reserved words for the other
+intents, and spelled as a scope each read as a demand while silently producing
+its opposite. A fixed `guard("ignore-credentials")` throws too, and a resolver
+returning it is undeclared: `ignoreCredentials()` is a declaration only.
 
 ### Behaviour
 
@@ -303,6 +345,8 @@ Rows are in evaluation order, and the first is first for a reason.
 
 | Situation | Answer | Center called |
 |---|---|---|
+| Route declaring `ignoreCredentials()`, **safe** method, any header or none | proceeds, identity `null`, header **not read** | **no** |
+| Route declaring `ignoreCredentials()`, **mutating** method (via a mount) | `500` `this route declares no required scope`, header **not read** | **no** |
 | **Mutating** route declaring `"none"` | `500` `this route declares no required scope` | **no** |
 | An **undeclared** route, on any method | `500` `this route declares no required scope` | **no** |
 | No `Authorization`, **safe** method declaring `"none"` | proceeds as a visitor, identity `null` | **no** |

@@ -43,6 +43,7 @@ export {
 } from "./messages";
 
 export type {
+  DeclaredRequirement,
   ExpressAuth,
   GuardContext,
   HandlerLike,
@@ -54,6 +55,7 @@ export type {
 export {
   actorOf,
   createExpressAuth,
+  CREDENTIALS_IGNORED,
   hasScope,
   identityOf,
   kindOf,
