@@ -22,7 +22,7 @@ URL, which `package-lock.json` records with an integrity hash, so the Docker
 build needs no token and no git.
 
 ```sh
-npm install https://github.com/V-M-Pioneer-Trading/ts-introspection-client/releases/download/v1.1.0/v-m-pioneer-trading-introspection-client-1.1.0.tgz
+npm install https://github.com/V-M-Pioneer-Trading/ts-introspection-client/releases/download/v1.1.1/v-m-pioneer-trading-introspection-client-1.1.1.tgz
 ```
 
 ## Quick start
@@ -353,7 +353,7 @@ Rows are in evaluation order, and the first is first for a reason.
 | `Authorization` that is not `Bearer <something>` | `401` `a bearer token is required` | **no** |
 | No `Authorization`, route declaring a session or a scope | `401` `a bearer token is required` | **no** |
 | `{"active": false}` | `401` `invalid or expired session`, on **every** method | yes |
-| Active, route declares `"session"` | proceeds, even with no scopes at all | yes |
+| Active, route declares `"session"` | proceeds, even with no scopes at all — `"scope":""` and no `scope` key alike (RFC 7662 makes it optional) | yes |
 | Active, route's scope missing | `403` `this action requires a scope this session does not carry` — the scope is **not** named | yes |
 | Active, route's scope present | proceeds with `{sub, kind, scopes}` | yes |
 | Center unreachable, timed out, non-2xx, malformed, or rejecting our secret | `503` `the authentication service could not process this request` | yes |

@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.1 — 2026-09-23
+
+Bug fix, no API change. Part of V-M-Pioneer-Trading/meta#80 (step 6).
+
+### Fixed
+
+- **An active answer with no `scope` key was read as malformed and answered
+  `503` (present in 1.0.0 and 1.1.0).** RFC 7662 makes `scope` optional, and
+  auth-service left it out for a verified token carrying no scopes, so a
+  signed-in operator with no scopes could not reach a `"session"` route at
+  all. An absent `scope` now means an empty scope list, exactly like
+  `"scope":""`: a `"session"` route proceeds with `scopes: []`, and a route
+  requiring a scope answers `403`. A `scope` that is present but not a string
+  is still `503`. auth-service PR #4 also stops omitting the key; either side
+  alone closes the hole.
+
 ## 1.1.0 — 2026-09-23
 
 Additive, plus one security fix. Part of V-M-Pioneer-Trading/meta#80 (step 5).
