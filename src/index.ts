@@ -3,7 +3,7 @@
  *
  * Three entry points, deliberately separate:
  *
- * - {@link createAuthorizer} — the framework-agnostic policy, the thirty-five
+ * - {@link createAuthorizer} — the framework-agnostic policy, the thirty-seven
  *   calling-service cases of `meta/fixtures/introspection.json`.
  * - {@link createExpressAuth} — the Express 4 adapter over it, whose
  *   declarations live at route registration so Express's own matcher binds

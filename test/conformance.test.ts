@@ -1,5 +1,5 @@
 /**
- * @file All forty-five conditions of meta's introspection fixture.
+ * @file All forty-eight conditions of meta's introspection fixture.
  *
  * Driven against a real local HTTP stub, one per case, so that what the client
  * sends is asserted on the wire and not against a mock of itself. Nothing here
