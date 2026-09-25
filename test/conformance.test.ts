@@ -1,5 +1,5 @@
 /**
- * @file All forty-five conditions of meta's introspection fixture.
+ * @file All forty-eight conditions of meta's introspection fixture.
  *
  * Driven against a real local HTTP stub, one per case, so that what the client
  * sends is asserted on the wire and not against a mock of itself. Nothing here
@@ -51,7 +51,7 @@ describe("the vendored fixture", () => {
     // Belt and braces: if both the copy and SOURCE were edited together, this
     // literal still pins the bytes the implementation was reviewed against.
     expect(fixtureSha256()).toBe(
-      "e605f62b820129068acbaef5d67af9b49df9fcf2247d0319ec4f9196338ea3a8"
+      "77f845c89d4baabef7a336325a9e30360d908fd761ad450904c693621547dfa3"
     );
   });
 
@@ -87,19 +87,22 @@ describe("the vendored fixture", () => {
       "operator-on-public-get",
       "options-on-guarded-route-with-no-header",
       "options-with-no-declared-scope",
+      "scoped-route-with-token-lacking-scope-key",
       "session-route-with-inactive-token",
       "session-route-with-no-header",
       "session-route-with-scopeless-token",
+      "session-route-with-token-lacking-scope-key",
       "token-on-public-get-while-center-is-down",
       "visitor-on-public-get",
     ]);
-    expect(fixture.cases).toHaveLength(35);
+    expect(fixture.cases).toHaveLength(37);
   });
 
   it("holds exactly the gateway cases this suite implements", () => {
     expect(fixture.gatewayCases.map((c) => c.name).sort()).toEqual([
       "gateway-active-machine",
       "gateway-active-operator",
+      "gateway-active-operator-lacking-scope-key",
       "gateway-bearer-with-empty-token",
       "gateway-center-rejects-our-caller-secret",
       "gateway-center-unreachable",
@@ -109,14 +112,15 @@ describe("the vendored fixture", () => {
       "gateway-no-header",
       "gateway-non-bearer-scheme",
     ]);
-    expect(fixture.gatewayCases).toHaveLength(10);
+    expect(fixture.gatewayCases).toHaveLength(11);
   });
 
-  it("is fixture version 2, the one that exempts the safe methods", () => {
-    // Version 1 declared default-deny on every non-GET method. A copy that
-    // fell back to it would silently stop asserting the HEAD and OPTIONS
-    // cases, which is the drift this number exists to make visible.
-    expect(fixture.version).toBe(2);
+  it("is fixture version 3, the one where an active answer may omit scope", () => {
+    // Version 1 declared default-deny on every non-GET method; version 2
+    // exempted the safe methods; version 3 added answers with no `scope` key.
+    // A copy that fell back would silently stop asserting those cases, which
+    // is the drift this number exists to make visible.
+    expect(fixture.version).toBe(3);
   });
 
   it("pins the names the implementation hard-codes", () => {

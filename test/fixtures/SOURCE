@@ -1,22 +1,18 @@
 introspection.json is vendored verbatim. It is not maintained here.
 
   original    V-M-Pioneer-Trading/meta, path fixtures/introspection.json
-  meta commit 53b2cd8cc1007c62d22a3abe7970bf7e16d8814f
-  blob        e1399314dee4aec96e93c7a004a7126c4a2e5a6f
-  vendored    2026-09-21
-  version     2
-  cases       35 calling-service + 10 gateway = 45
-  bytes       46238
-  sha256      e605f62b820129068acbaef5d67af9b49df9fcf2247d0319ec4f9196338ea3a8
+  meta commit 9b6274657743ec6f626f7d56e4a01069de7d43e0
+  blob        095716953b29e5cd3ce9662d77347490f8d062ee
+  vendored    2026-09-25
+  version     3
+  cases       37 calling-service + 11 gateway = 48
+  bytes       49347
+  sha256      77f845c89d4baabef7a336325a9e30360d908fd761ad450904c693621547dfa3
 
 The commit above is a commit on meta's **main**: the squash of
-V-M-Pioneer-Trading/meta#84 ("Exempt the safe methods from default-deny
-(meta#80 step 4)"). This record used to point at that PR's unmerged head,
-`ea03016`, because the package implements the safe-method rule and could not
-honestly point at a commit predating it; the re-point was made when #84
-merged. It carried the same blob across the squash, exactly as predicted, so
-`blob`, `bytes` and `sha256` are unchanged and only the commit line moved —
-which is the check that the merge edited nothing.
+V-M-Pioneer-Trading/meta#88 ("fixture v3: an active answer may omit scope,
+and means no scopes"). Version 3 adds three cases whose center answer has no
+`scope` key; 1.1.1 is the first release that passes them.
 
 The sha256 is over the LF bytes of the blob as git stores it, which is what
 `git show <commit>:fixtures/introspection.json` prints. test/conformance.test.ts
