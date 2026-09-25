@@ -63,13 +63,18 @@ const readBody = (body: unknown): CenterAnswer | null => {
 
   const { sub, scope, exp, kind } = record;
   if (typeof sub !== "string" || sub.length === 0) return null;
-  if (typeof scope !== "string") return null;
+  // RFC 7662 makes `scope` OPTIONAL on an active answer, and auth-service
+  // before its PR #4 left the key out for a token carrying no scopes. Absent
+  // means "no scopes", exactly as `"scope":""` does; a session route must let
+  // that caller through, not answer 503. Present-but-not-a-string is still a
+  // center we do not understand (agent-service's Go client draws the same line).
+  if (scope !== undefined && typeof scope !== "string") return null;
   if (typeof exp !== "number" || !Number.isFinite(exp)) return null;
   if (!isKind(kind)) return null;
 
   return {
     state: "active",
-    identity: { sub, kind, scopes: splitScopes(scope) },
+    identity: { sub, kind, scopes: splitScopes(scope ?? "") },
   };
 };
 

@@ -197,7 +197,7 @@ describe("a partial or wrongly typed answer is unavailable, never inactive", () 
   const bad: Array<[string, string]> = [
     ["missing sub", '{"active":true,"scope":"a","exp":1,"kind":"operator"}'],
     ["missing kind", '{"active":true,"sub":"user_a","scope":"a","exp":1}'],
-    ["missing scope", '{"active":true,"sub":"user_a","exp":1,"kind":"operator"}'],
+    ["scope as null", '{"active":true,"sub":"user_a","scope":null,"exp":1,"kind":"operator"}'],
     ["missing exp", '{"active":true,"sub":"user_a","scope":"a","kind":"operator"}'],
     [
       "unknown kind",
@@ -228,6 +228,50 @@ describe("a partial or wrongly typed answer is unavailable, never inactive", () 
         outcome: "reject",
         status: 503,
         message: MESSAGES.centerUnavailable,
+      });
+    } finally {
+      await center.close();
+    }
+  });
+});
+
+describe("an active answer with no scope key means no scopes", () => {
+  // RFC 7662 makes `scope` optional, and auth-service omitted it for a
+  // scopeless token until its PR #4. v1.1.0 answered 503 to every such
+  // session: a signed-in guest could not reach a `session` route at all.
+  const ABSENT = '{"active":true,"sub":"user_guest","exp":4102444800,"kind":"operator"}';
+
+  it("lets a session route proceed with an empty scope list", async () => {
+    const center = await startStubCenter({ status: 200, body: ABSENT });
+    try {
+      const authorizer = createAuthorizer({ url: center.url, secret: SECRET });
+      const decision = await authorizer.authorize({
+        method: "GET",
+        requires: "session",
+        authorization: `Bearer ${TOKEN}`,
+      });
+      expect(decision).toEqual({
+        outcome: "proceed",
+        identity: { sub: "user_guest", kind: "operator", scopes: [] },
+      });
+    } finally {
+      await center.close();
+    }
+  });
+
+  it("is still 403, not 503, on a route that needs a scope", async () => {
+    const center = await startStubCenter({ status: 200, body: ABSENT });
+    try {
+      const authorizer = createAuthorizer({ url: center.url, secret: SECRET });
+      const decision = await authorizer.authorize({
+        method: "POST",
+        requires: "fleet:control",
+        authorization: `Bearer ${TOKEN}`,
+      });
+      expect(decision).toEqual({
+        outcome: "reject",
+        status: 403,
+        message: MESSAGES.missingScope,
       });
     } finally {
       await center.close();
